@@ -253,6 +253,11 @@ def main():
     parser.add_argument("--num_batches_per_epoch", type=int, default=5000)
     parser.add_argument("--val_num_batches", type=int, default=500)
     parser.add_argument("--output_model_dir", type=str, required=True)
+    parser.add_argument(
+        "--preprocessed_rxn_dir",
+        type=str,
+        default=str(CARE_ROOT / "runtime" / "task3_preprocessed"),
+    )
     parser.add_argument("--wandb_project", type=str, default="care-task3-creep")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="offline", choices=["offline", "online", "disabled"])
@@ -300,8 +305,9 @@ def main():
     )
     text_dim = 768
 
-    reaction_tokenizer = SmilesTokenizer.from_pretrained(str(CREEP_ROOT / "data" / "pretrained_rxnfp" / "vocab.txt"))
-    reaction_model = BertModel.from_pretrained(str(CREEP_ROOT / "data" / "pretrained_rxnfp"))
+    rxnfp_dir = CREEP_ROOT / "data" / "pretrained_rxnfp"
+    reaction_tokenizer = SmilesTokenizer(str(rxnfp_dir / "vocab.txt"), do_lower_case=False)
+    reaction_model = BertModel.from_pretrained(str(rxnfp_dir), local_files_only=True)
     reaction_dim = 256
 
     protein2latent_model = nn.Linear(protein_dim, args.ssl_emb_dim)
@@ -333,6 +339,7 @@ def main():
         reaction_tokenizer=reaction_tokenizer,
         protein_max_sequence_len=args.protein_max_sequence_len,
         reaction_max_sequence_len=args.reaction_max_sequence_len,
+        preprocessed_dir=args.preprocessed_rxn_dir,
     )
     dump_stats(args.output_model_dir, "train", train_dataset.stats)
     print("train dataset stats", train_dataset.stats)
@@ -347,6 +354,7 @@ def main():
             reaction_tokenizer=reaction_tokenizer,
             protein_max_sequence_len=args.protein_max_sequence_len,
             reaction_max_sequence_len=args.reaction_max_sequence_len,
+            preprocessed_dir=args.preprocessed_rxn_dir,
         )
         dump_stats(args.output_model_dir, "val", val_dataset.stats)
         print("val dataset stats", val_dataset.stats)

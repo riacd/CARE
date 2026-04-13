@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ from torch.utils.data import Dataset, Sampler
 from CREEP.datasets.dataset_CREEP import encode_sequence
 
 RDLogger.DisableLog("rdApp.warning")
+TASK3_RXN_PREPROCESS_VERSION = "v2"
 
 
 def _unmap_smiles(smiles):
@@ -41,17 +43,49 @@ def _load_enzyme_db(enzyme_db_path):
     return enzyme_db
 
 
-def load_task3_pairs(split_file, pair_db_path, enzyme_db_path):
+def _build_preprocessed_rxn_key(pair_db_path):
+    digest = hashlib.sha256()
+    path = Path(pair_db_path)
+    stat = path.stat()
+    digest.update(str(path.resolve()).encode("utf-8"))
+    digest.update(str(stat.st_size).encode("utf-8"))
+    digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+    digest.update(TASK3_RXN_PREPROCESS_VERSION.encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def _resolve_preprocessed_rxn_path(preprocessed_dir, pair_db_path):
+    if preprocessed_dir is None:
+        return None
+    preprocessed_dir = Path(preprocessed_dir)
+    pair_db_path = Path(pair_db_path)
+    preprocess_key = _build_preprocessed_rxn_key(pair_db_path)
+    return preprocessed_dir / f"{pair_db_path.stem}_deaam_{preprocess_key}.tsv"
+
+
+def _load_or_preprocess_pair_db(pair_db_path, preprocessed_dir=None):
+    pair_db = pd.read_csv(pair_db_path, sep="\t", usecols=["rxn_id", "enz_id", "mapped_rxn"])
+    pair_db = pair_db.drop_duplicates(["rxn_id", "enz_id"]).reset_index(drop=True)
+    preprocessed_rxn_path = _resolve_preprocessed_rxn_path(preprocessed_dir, pair_db_path)
+    if preprocessed_rxn_path is not None and preprocessed_rxn_path.exists():
+        print(f"Loaded task3 de-AAM reactions from {preprocessed_rxn_path}")
+        return pd.read_csv(preprocessed_rxn_path, sep="\t")
+
+    pair_db["reaction"] = pair_db["mapped_rxn"].map(_unmap_reaction)
+    if preprocessed_rxn_path is not None:
+        preprocessed_rxn_path.parent.mkdir(parents=True, exist_ok=True)
+        pair_db.to_csv(preprocessed_rxn_path, sep="\t", index=False)
+        print(f"Saved task3 de-AAM reactions to {preprocessed_rxn_path}")
+    return pair_db
+
+
+def load_task3_pairs(split_file, pair_db_path, enzyme_db_path, preprocessed_dir=None):
     split_file = Path(split_file)
     pairs = pd.read_csv(split_file, sep="\t")
     pairs = pairs[["rxn_id", "enz_id"]].drop_duplicates().reset_index(drop=True)
 
-    pair_db = pd.read_csv(pair_db_path, sep="\t", usecols=["rxn_id", "enz_id", "mapped_rxn"])
-    pair_db = pair_db.drop_duplicates(["rxn_id", "enz_id"]).reset_index(drop=True)
-
+    pair_db = _load_or_preprocess_pair_db(pair_db_path, preprocessed_dir=preprocessed_dir)
     pairs = pairs.merge(pair_db, on=["rxn_id", "enz_id"], how="left")
-    pairs["reaction"] = pairs["mapped_rxn"].map(_unmap_reaction)
-
     enzyme_db = _load_enzyme_db(enzyme_db_path)
     pairs["sequence"] = pairs["enz_id"].map(enzyme_db)
 
@@ -77,12 +111,18 @@ class Task3CREEPDataset(Dataset):
         reaction_tokenizer,
         protein_max_sequence_len,
         reaction_max_sequence_len,
+        preprocessed_dir=None,
     ):
         self.protein_tokenizer = protein_tokenizer
         self.reaction_tokenizer = reaction_tokenizer
         self.protein_max_sequence_len = protein_max_sequence_len
         self.reaction_max_sequence_len = reaction_max_sequence_len
-        self.pairs, self.stats = load_task3_pairs(split_file, pair_db_path, enzyme_db_path)
+        self.pairs, self.stats = load_task3_pairs(
+            split_file,
+            pair_db_path,
+            enzyme_db_path,
+            preprocessed_dir=preprocessed_dir,
+        )
 
     def __getitem__(self, index):
         row = self.pairs.iloc[index]

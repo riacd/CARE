@@ -183,6 +183,11 @@ dmypy.json
 
 # Large packaged environments and datasets
 /.codex
+/runtime/*
+!/runtime/README.md
+!/runtime/*.sh
+!/runtime/*.yml
+!/runtime/*.txt
 /runtime/*.tar.gz
 /runtime/*.tar.gz.sha256
 /splits/task1/fastas/train_swissprot.fasta

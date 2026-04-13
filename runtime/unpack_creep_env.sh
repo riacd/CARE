@@ -14,8 +14,18 @@ mkdir -p "${TARGET_DIR}"
 tar -xzf "${ARCHIVE_PATH}" -C "${TARGET_DIR}"
 "${TARGET_DIR}/bin/conda-unpack"
 
+cat > "${TARGET_DIR}/activate_runtime.sh" <<'EOF'
+#!/usr/bin/env bash
+CARE_CREEP_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export CARE_CREEP_ENV_DIR
+export PYTHONHOME="${CARE_CREEP_ENV_DIR}"
+export PATH="${CARE_CREEP_ENV_DIR}/bin:${PATH}"
+EOF
+
+chmod +x "${TARGET_DIR}/activate_runtime.sh"
+
 cat <<EOF
 environment unpacked to: ${TARGET_DIR}
 activate with:
-  source ${TARGET_DIR}/bin/activate
+  source ${TARGET_DIR}/activate_runtime.sh
 EOF

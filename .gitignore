@@ -194,3 +194,8 @@ dmypy.json
 /splits/task1/protein_train.csv
 /splits/task2/*_reaction_train.csv
 /task3/data/
+/Additional_Study/
+/baseline/
+
+
+

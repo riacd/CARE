@@ -98,6 +98,17 @@ def parse_args():
         type=str,
         default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
     )
+    parser.add_argument(
+        "--enzyme_candidates_mode",
+        type=str,
+        default="extended",
+        choices=["extended", "original_entries"],
+    )
+    parser.add_argument(
+        "--enzyme_db_metadata_path",
+        type=str,
+        default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.metadata.json"),
+    )
     parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
     parser.add_argument("--reaction_backbone_model", type=str, default="rxnfp")
     parser.add_argument("--protein_max_sequence_len", type=int, default=512)
@@ -210,14 +221,48 @@ def build_reaction_model(args, device):
     return reaction_tokenizer, model
 
 
-def load_ordered_enzyme_entries(enzyme_db_path, max_enzymes=None):
+def load_original_entry_limit(enzyme_db_metadata_path):
+    with open(enzyme_db_metadata_path) as f:
+        enzyme_db_metadata = json.load(f)
+
+    original_entries = enzyme_db_metadata.get("original_entries")
+    if original_entries is None:
+        raise ValueError(
+            f"`original_entries` is missing from enzyme db metadata: {enzyme_db_metadata_path}"
+        )
+    if not isinstance(original_entries, int) or original_entries < 0:
+        raise ValueError(
+            f"`original_entries` must be a non-negative integer in {enzyme_db_metadata_path}"
+        )
+    return original_entries
+
+
+def load_ordered_enzyme_entries(
+    enzyme_db_path,
+    enzyme_candidates_mode="extended",
+    enzyme_db_metadata_path=None,
+    max_enzymes=None,
+):
     with open(enzyme_db_path) as f:
         enzyme_db = json.load(f)
 
     entries = list(enzyme_db.items())
+    original_entries = None
+    if enzyme_candidates_mode == "original_entries":
+        if enzyme_db_metadata_path is None:
+            raise ValueError(
+                "`enzyme_db_metadata_path` is required when --enzyme_candidates_mode=original_entries"
+            )
+        original_entries = load_original_entry_limit(enzyme_db_metadata_path)
+        if original_entries > len(entries):
+            raise ValueError(
+                f"Metadata original_entries={original_entries} exceeds enzyme db size={len(entries)}"
+            )
+        entries = entries[:original_entries]
+
     if max_enzymes is not None:
         entries = entries[:max_enzymes]
-    return entries
+    return entries, original_entries
 
 
 def load_ordered_reaction_entries(split_file, pair_db_path, preprocessed_dir=None, max_reactions=None):
@@ -346,12 +391,19 @@ def build_metadata(args, split_type, split_file, row_ids, col_ids, pred_path):
         "split_file": str(split_file),
         "pair_db_path": str(args.pair_db_path),
         "enzyme_db_path": str(args.enzyme_db_path),
+        "enzyme_candidates_mode": args.enzyme_candidates_mode,
+        "enzyme_db_metadata_path": str(args.enzyme_db_metadata_path),
         "pretrained_folder": str(args.pretrained_folder),
         "checkpoint_variant": "final" if args.use_final_checkpoint else "best",
         "dtype": str(pred_array.dtype),
         "shape": [int(pred_array.shape[0]), int(pred_array.shape[1])],
         "num_reactions": len(row_ids),
         "num_enzymes": len(col_ids),
+        "original_entry_limit": (
+            load_original_entry_limit(args.enzyme_db_metadata_path)
+            if args.enzyme_candidates_mode == "original_entries"
+            else None
+        ),
         "max_reactions": args.max_reactions,
         "max_enzymes": args.max_enzymes,
     }
@@ -369,6 +421,10 @@ def ensure_dir(path):
     return path
 
 
+def get_output_suffix(enzyme_candidates_mode):
+    return "" if enzyme_candidates_mode == "extended" else f"_{enzyme_candidates_mode}"
+
+
 def main():
     args = parse_args()
     print("arguments", args)
@@ -380,9 +436,15 @@ def main():
 
     split_types = ["enzyme_split", "rxn_sub_split"] if args.split_type == "all" else [args.split_type]
 
-    enzyme_entries = load_ordered_enzyme_entries(args.enzyme_db_path, max_enzymes=args.max_enzymes)
+    enzyme_entries, _ = load_ordered_enzyme_entries(
+        args.enzyme_db_path,
+        enzyme_candidates_mode=args.enzyme_candidates_mode,
+        enzyme_db_metadata_path=args.enzyme_db_metadata_path,
+        max_enzymes=args.max_enzymes,
+    )
     enzyme_ids = [enzyme_id for enzyme_id, _ in enzyme_entries]
-    protein_embedding_path = output_dir / "_tmp_protein_embeddings.npy"
+    output_suffix = get_output_suffix(args.enzyme_candidates_mode)
+    protein_embedding_path = output_dir / f"_tmp_protein_embeddings{output_suffix}.npy"
 
     protein_tokenizer, protein_model = build_protein_model(args, device)
     extract_embeddings(
@@ -411,10 +473,10 @@ def main():
         )
         reaction_ids = [reaction_id for reaction_id, _ in reaction_entries]
         reaction_embedding_path = output_dir / f"_tmp_{split_type}_reaction_embeddings.npy"
-        pred_path = output_dir / f"{split_type}_preds.npy"
-        row_path = output_dir / f"{split_type}_row_rxn_ids.tsv"
-        col_path = output_dir / f"{split_type}_col_enz_ids.tsv"
-        metadata_path = output_dir / f"{split_type}_metadata.json"
+        pred_path = output_dir / f"{split_type}{output_suffix}_preds.npy"
+        row_path = output_dir / f"{split_type}{output_suffix}_row_rxn_ids.tsv"
+        col_path = output_dir / f"{split_type}{output_suffix}_col_enz_ids.tsv"
+        metadata_path = output_dir / f"{split_type}{output_suffix}_metadata.json"
 
         extract_embeddings(
             entries=reaction_entries,

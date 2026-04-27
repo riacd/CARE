@@ -43,6 +43,8 @@ from CREEP.datasets import Task3CREEPDataset, Task3PairBatchSampler
 from CREEP.models import AEFacilitatorModel, CREEPModel
 from CREEP.utils.tokenization import SmilesTokenizer
 
+BF16_DTYPE = torch.bfloat16
+
 
 class Logger:
     def __init__(self, filename, mode="a"):
@@ -65,6 +67,9 @@ def cycle_index(num, shift):
 
 
 def do_cl(x, y, args):
+    x = x.float()
+    y = y.float()
+
     if args.normalize:
         x = F.normalize(x, dim=-1)
         y = F.normalize(y, dim=-1)
@@ -108,7 +113,13 @@ def move_batch_to_device(batch, device):
     return moved
 
 
-def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
+def convert_module_to_bf16(module, device=None):
+    if device is None:
+        return module.to(dtype=BF16_DTYPE)
+    return module.to(device=device, dtype=BF16_DTYPE)
+
+
+def run_epoch(dataloader, model, optimizer, device, args, training):
     if training:
         model.train()
     else:
@@ -116,7 +127,6 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
 
     iterator = tqdm(dataloader) if args.verbose else dataloader
     mse_loss = nn.MSELoss()
-    amp_enabled = device.type == "cuda"
     start_time = time.time()
 
     total_loss = 0.0
@@ -135,32 +145,33 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(training):
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
-                protein_repr, _, reaction_repr, reaction2protein_repr, protein2reaction_repr = model(
-                    protein_sequence_input_ids=protein_input_ids,
-                    protein_sequence_attention_mask=protein_attention_mask,
-                    reaction_sequence_input_ids=reaction_input_ids,
-                    reaction_sequence_attention_mask=reaction_attention_mask,
-                )
+            protein_repr, _, reaction_repr, reaction2protein_repr, protein2reaction_repr = model(
+                protein_sequence_input_ids=protein_input_ids,
+                protein_sequence_attention_mask=protein_attention_mask,
+                reaction_sequence_input_ids=reaction_input_ids,
+                reaction_sequence_attention_mask=reaction_attention_mask,
+            )
 
-                loss_pr, acc_pr = do_cl(protein_repr, reaction_repr, args)
-                loss_rp, acc_rp = do_cl(reaction_repr, protein_repr, args)
-                contrastive_loss = (loss_pr + loss_rp) / 2
-                contrastive_acc = (acc_pr + acc_rp) / 2
+            loss_pr, acc_pr = do_cl(protein_repr, reaction_repr, args)
+            loss_rp, acc_rp = do_cl(reaction_repr, protein_repr, args)
+            contrastive_loss = (loss_pr + loss_rp) / 2
+            contrastive_acc = (acc_pr + acc_rp) / 2
 
-                generative_loss = mse_loss(reaction2protein_repr, protein_repr) + mse_loss(
-                    protein2reaction_repr,
-                    reaction_repr,
-                )
-                loss = (
-                    args.alpha_contrastive * contrastive_loss
-                    + args.alpha_generative * generative_loss
-                )
+            generative_loss = mse_loss(
+                reaction2protein_repr.float(),
+                protein_repr.float(),
+            ) + mse_loss(
+                protein2reaction_repr.float(),
+                reaction_repr.float(),
+            )
+            loss = (
+                args.alpha_contrastive * contrastive_loss
+                + args.alpha_generative * generative_loss
+            )
 
         if training:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            loss.backward()
+            optimizer.step()
 
         total_loss += loss.item()
         total_contrastive_loss += contrastive_loss.item()
@@ -329,7 +340,7 @@ def main():
         args.text_backbone_model,
         args.reaction_backbone_model,
     )
-    model.to(device)
+    model = convert_module_to_bf16(model, device=device)
 
     train_dataset = Task3CREEPDataset(
         split_file=args.train_file,
@@ -368,7 +379,6 @@ def main():
         {"params": protein2reaction_facilitator_model.parameters(), "lr": args.protein_lr * args.protein_lr_scale},
     ]
     optimizer = optim.Adam(model_param_group, weight_decay=args.decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     model_parts = {
         "text": text_model,
@@ -394,7 +404,7 @@ def main():
             seed=args.seed,
             epoch=epoch,
         )
-        train_metrics = run_epoch(train_loader, model, optimizer, scaler, device, args, training=True)
+        train_metrics = run_epoch(train_loader, model, optimizer, device, args, training=True)
         print(
             "train "
             f"CL Loss: {train_metrics['contrastive_loss']:.5f}\t"
@@ -415,7 +425,7 @@ def main():
                 seed=args.seed + 10_000,
                 epoch=epoch,
             )
-            val_metrics = run_epoch(val_loader, model, optimizer, scaler, device, args, training=False)
+            val_metrics = run_epoch(val_loader, model, optimizer, device, args, training=False)
             print(
                 "val "
                 f"CL Loss: {val_metrics['contrastive_loss']:.5f}\t"

@@ -45,6 +45,8 @@ from CREEP.datasets.dataset_task3 import _load_or_preprocess_pair_db
 from CREEP.models import SingleModalityModel
 from CREEP.utils.tokenization import SmilesTokenizer
 
+BF16_DTYPE = torch.bfloat16
+
 
 class OrderedSequenceDataset(Dataset):
     def __init__(self, entries, tokenizer, max_sequence_len, modality):
@@ -161,6 +163,12 @@ def load_state_dict(module, checkpoint_path):
     return module
 
 
+def convert_module_to_bf16(module, device=None):
+    if device is None:
+        return module.to(dtype=BF16_DTYPE)
+    return module.to(device=device, dtype=BF16_DTYPE)
+
+
 def build_protein_model(args, device):
     protein_tokenizer = T5Tokenizer.from_pretrained(
         "Rostlab/prot_t5_xl_half_uniref50-enc",
@@ -191,7 +199,7 @@ def build_protein_model(args, device):
         "protein",
     )
     model.eval()
-    model.to(device)
+    model = convert_module_to_bf16(model, device=device)
     return protein_tokenizer, model
 
 
@@ -217,7 +225,7 @@ def build_reaction_model(args, device):
         "reaction",
     )
     model.eval()
-    model.to(device)
+    model = convert_module_to_bf16(model, device=device)
     return reaction_tokenizer, model
 
 
@@ -325,13 +333,11 @@ def extract_embeddings(
 
     iterator = tqdm(dataloader, desc=f"encode_{modality}") if verbose else dataloader
     offset = 0
-    amp_enabled = device.type == "cuda"
     with torch.no_grad():
         for batch in iterator:
             sequence_input_ids = batch["sequence_input_ids"].to(device, non_blocking=True)
             sequence_attention_mask = batch["sequence_attention_mask"].to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", enabled=amp_enabled):
-                repr_tensor = model(sequence_input_ids, sequence_attention_mask)
+            repr_tensor = model(sequence_input_ids, sequence_attention_mask)
             repr_tensor = F.normalize(repr_tensor.float(), dim=-1)
             batch_repr = repr_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
             embeddings[offset : offset + len(batch_repr)] = batch_repr

@@ -6,14 +6,14 @@ benchmark 设计如下
 
 ## 数据
 数据有两种切分，分别是按酶切分和按反应底物切粉，分别位于 
-1. @/task3/data/enzyme_split
-2. @/task3/data/rxn_sub_split
+1. @/data/enzyme_split
+2. @/data/rxn_sub_split
 包含 train & val 的 tsv 文件，文件中只描述 rxn & enz 的索引，数据需要根据索引在数据库中提取
-1. 蛋白数据库：@/task3/data/pair_merged_data/enzyme_db_extended.json
-2. 反应数据库：反应数据和索引的对应关系需要从 @/task3/data/pair_merged_data/all_pair_data.tsv 中提取
+1. 蛋白数据库：@/data/pair_merged_data/enzyme_db_extended.json
+2. 反应数据库：反应数据和索引的对应关系需要从 @/data/pair_merged_data/all_pair_data.tsv 中提取
 
 为保证 当前项目 可直接整体迁移到其它机器，Task 3 训练脚本默认只依赖项目目录内目录内的文件：
-1. `/task3/data/*` 中的 split 与 pair 数据
+1. `/data/*` 中的 split 与 pair 数据
 2. `/CREEP/data/pretrained_*` 中的初始化模型权重缓存
 
 
@@ -22,6 +22,34 @@ benchmark 设计如下
 1. 更新模型设计
 2. 更新训练代码
 3. 更新推理代码
+
+### 模态
+使用 三模态 对比学习
+1. protein 模态
+2. reaction 模态
+3. 文本 模态
+
+#### 文本数据收集
+已有的数据都是 protein, reaction 的 pair-wise 数据
+每一段文本模态内容如下：EC text + '\t' + IUPAC text
+#### IUPAC text
+需要使用如下步骤：
+1. 从 @data/pair_merged_data/all_pair_data.tsv 中读取每个 reaction 的 rxn_id 和 SMILES 表达式
+2. 将每个反应表达式拆分成其反应物 SMILES 集合以及产物 SMILES 集合。
+3. 对所有反应的反应物和产物分子取交集，得到一个所有分子SMILES，用文件保存，并根据 SMILES 找到每个分子对应的 IUPAC 名称，用一个 json 保存映射关系
+4. 再根据每个反应的SMILES 表达式重新获得 反应的 IUPAC text，具体方式为把原本的 反应SMILES 中每个分子的 SMILES 替换成 其对应的 IUPAC 名称，将SMILES反应中的 '.' 替换为 ‘ + ’， '>>' 替换为 '->'
+
+#### EC text
+文件描述如下：
+1. @processed_data/text2EC.csv 描述了 EC number 与 EC text 的对应关系
+
+获取每个反应对应的 EC text 步骤如下：
+1. 从 @data/pair_merged_data/all_pair_data.tsv 中获得全部 (rxn_id, enz_id) pair
+2. 根据 @data/proteins_afdb.tsv 中描述的 enz_id -> EC number 映射，可能一个 enz 对应多个 EC number，此时需要扩展，获得全部 (rxn_id, enz_id, EC number) ，其中每条只包含一个 EC number 【如果有enz_id 没有对应的 EC number 映射，则删除该条】
+3. 现在计算每个 rxn_id 对应的 EC number，具体算法为包含这个反应的所有 (rxn_id, enz_id, EC number) 条目中，最多出现的 EC number 就是反应对应的 EC number，如果有相同数目取前面那个
+4. 得到每个 rxn_id 的 EC number 以后，根据 @processed_data/text2EC.csv 中得到 EC number 对应的 EC text 
+5. 对于没有对应 EC text 的 rxn_id，它们的 EC text 取 ''
+
 ### 模型设计
 使用 @/CREEP/CREEP/models 中的 CREEP 模型，模型包含
 1. ProtT5：蛋白编码器，输入蛋白序列

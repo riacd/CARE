@@ -93,12 +93,12 @@ def parse_args():
     parser.add_argument(
         "--pair_db_path",
         type=str,
-        default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "all_pair_data.tsv"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "all_pair_data.tsv"),
     )
     parser.add_argument(
         "--enzyme_db_path",
         type=str,
-        default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
     )
     parser.add_argument(
         "--enzyme_candidates_mode",
@@ -109,7 +109,12 @@ def parse_args():
     parser.add_argument(
         "--enzyme_db_metadata_path",
         type=str,
-        default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.metadata.json"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "enzyme_db_extended.metadata.json"),
+    )
+    parser.add_argument(
+        "--rxn_db_metadata_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "metadata.csv"),
     )
     parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
     parser.add_argument("--reaction_backbone_model", type=str, default="rxnfp")
@@ -145,8 +150,8 @@ def set_seed(seed):
 
 def get_split_file(split_type):
     split_to_file = {
-        "enzyme_split": CARE_ROOT / "task3" / "data" / "enzyme_split" / "val_pairs.tsv",
-        "rxn_sub_split": CARE_ROOT / "task3" / "data" / "rxn_sub_split" / "val_reactions.tsv",
+        "enzyme_split": CARE_ROOT / "data" / "enzyme_split" / "val_pairs.tsv",
+        "rxn_sub_split": CARE_ROOT / "data" / "rxn_sub_split" / "val_reactions.tsv",
     }
     return split_to_file[split_type]
 
@@ -273,9 +278,37 @@ def load_ordered_enzyme_entries(
     return entries, original_entries
 
 
-def load_ordered_reaction_entries(split_file, pair_db_path, preprocessed_dir=None, max_reactions=None):
-    split_df = pd.read_csv(split_file, sep="\t", usecols=["rxn_id"])
-    ordered_rxn_ids = split_df["rxn_id"].drop_duplicates().tolist()
+def load_screening_pair_ids(split_file, rxn_db_metadata_path, valid_enz_ids):
+    pair_ids = pd.read_csv(
+        split_file,
+        sep="\t" if str(split_file).endswith(".tsv") else ",",
+        usecols=["rxn_id", "enz_id"],
+    )
+
+    valid_rxn_ids = pd.read_csv(
+        rxn_db_metadata_path,
+        usecols=["rxn_id"],
+    )["rxn_id"]
+    pair_ids = pair_ids[
+        pair_ids["rxn_id"].isin(valid_rxn_ids) & pair_ids["enz_id"].isin(valid_enz_ids)
+    ].copy()
+    return pair_ids
+
+
+def load_ordered_reaction_entries(
+    split_file,
+    pair_db_path,
+    rxn_db_metadata_path,
+    valid_enz_ids,
+    preprocessed_dir=None,
+    max_reactions=None,
+):
+    pair_ids = load_screening_pair_ids(
+        split_file=split_file,
+        rxn_db_metadata_path=rxn_db_metadata_path,
+        valid_enz_ids=valid_enz_ids,
+    )
+    ordered_rxn_ids = pair_ids["rxn_id"].drop_duplicates().tolist()
     if max_reactions is not None:
         ordered_rxn_ids = ordered_rxn_ids[:max_reactions]
 
@@ -299,7 +332,11 @@ def load_ordered_reaction_entries(split_file, pair_db_path, preprocessed_dir=Non
     if missing_rxns:
         raise ValueError(f"Missing reaction strings for rxn_id(s): {missing_rxns[:10]}")
 
-    return list(zip(ordered_reactions["rxn_id"].tolist(), ordered_reactions["reaction"].tolist()))
+    filtered_pair_ids = pair_ids[pair_ids["rxn_id"].isin(ordered_rxn_ids)].copy()
+    return (
+        list(zip(ordered_reactions["rxn_id"].tolist(), ordered_reactions["reaction"].tolist())),
+        filtered_pair_ids,
+    )
 
 
 def extract_embeddings(
@@ -390,7 +427,7 @@ def write_single_column_tsv(path, column_name, values):
             f.write(f"{value}\n")
 
 
-def build_metadata(args, split_type, split_file, row_ids, col_ids, pred_path):
+def build_metadata(args, split_type, split_file, row_ids, col_ids, pred_path, filtered_pair_ids):
     pred_array = np.load(pred_path, mmap_mode="r")
     return {
         "split_type": split_type,
@@ -399,12 +436,15 @@ def build_metadata(args, split_type, split_file, row_ids, col_ids, pred_path):
         "enzyme_db_path": str(args.enzyme_db_path),
         "enzyme_candidates_mode": args.enzyme_candidates_mode,
         "enzyme_db_metadata_path": str(args.enzyme_db_metadata_path),
+        "rxn_db_metadata_path": str(args.rxn_db_metadata_path),
         "pretrained_folder": str(args.pretrained_folder),
         "checkpoint_variant": "final" if args.use_final_checkpoint else "best",
         "dtype": str(pred_array.dtype),
         "shape": [int(pred_array.shape[0]), int(pred_array.shape[1])],
         "num_reactions": len(row_ids),
         "num_enzymes": len(col_ids),
+        "num_filtered_pairs": int(len(filtered_pair_ids)),
+        "num_filtered_positive_enzymes": int(filtered_pair_ids["enz_id"].nunique()),
         "original_entry_limit": (
             load_original_entry_limit(args.enzyme_db_metadata_path)
             if args.enzyme_candidates_mode == "original_entries"
@@ -449,6 +489,7 @@ def main():
         max_enzymes=args.max_enzymes,
     )
     enzyme_ids = [enzyme_id for enzyme_id, _ in enzyme_entries]
+    valid_enzyme_ids = set(enzyme_ids)
     output_suffix = get_output_suffix(args.enzyme_candidates_mode)
     protein_embedding_path = output_dir / f"_tmp_protein_embeddings{output_suffix}.npy"
 
@@ -471,9 +512,11 @@ def main():
     reaction_tokenizer, reaction_model = build_reaction_model(args, device)
     for split_type in split_types:
         split_file = Path(args.split_file) if args.split_file else get_split_file(split_type)
-        reaction_entries = load_ordered_reaction_entries(
+        reaction_entries, filtered_pair_ids = load_ordered_reaction_entries(
             split_file=split_file,
             pair_db_path=args.pair_db_path,
+            rxn_db_metadata_path=args.rxn_db_metadata_path,
+            valid_enz_ids=valid_enzyme_ids,
             preprocessed_dir=args.preprocessed_rxn_dir,
             max_reactions=args.max_reactions,
         )
@@ -510,7 +553,15 @@ def main():
         write_single_column_tsv(col_path, "enz_id", enzyme_ids)
         with open(metadata_path, "w") as f:
             json.dump(
-                build_metadata(args, split_type, split_file, reaction_ids, enzyme_ids, pred_path),
+                build_metadata(
+                    args,
+                    split_type,
+                    split_file,
+                    reaction_ids,
+                    enzyme_ids,
+                    pred_path,
+                    filtered_pair_ids,
+                ),
                 f,
                 indent=2,
             )

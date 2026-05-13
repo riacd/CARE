@@ -133,13 +133,26 @@ def screening_metrics(preds, labels, alpha=85, fraction=0.02, reduce=True, ignor
         f'ef@{fraction}': ef
     }
 
+def load_pred_matrix(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.npy':
+        preds = np.load(path)
+        return torch.from_numpy(preds)
+
+    preds = torch.load(path)
+    if isinstance(preds, torch.Tensor):
+        return preds
+    if isinstance(preds, np.ndarray):
+        return torch.from_numpy(preds)
+    return torch.as_tensor(preds)
+
 def pairwise_identity(seq1, seq2):
     best_aln = pairwise2.align.globalxx(seq1, seq2)[0]
     matches = sum(a == b for a, b in zip(best_aln.seqA, best_aln.seqB))
     return matches / len(best_aln.seqA)
 
 def get_max_rxn_sims(train_ids, test_ids):
-    all_data = pd.read_pickle('data/pair_merged_data/rxn_uniprot_pair_merged_data_washed_with_drfp.pkl')
+    all_data = pd.read_pickle('/mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/rxn_uniprot_pair_merged_data_washed_with_drfp.pkl')
     all_drfps = all_data.set_index('rxn_id')['DRFP']
     train_drfps = all_drfps[train_ids['rxn_id'].unique()]
     train_drfps = torch.from_numpy(np.array(train_drfps.tolist())).float()
@@ -186,7 +199,9 @@ def parse_args():
 # -tid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/train_pairs.tsv \
 # -sid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/val_pairs.tsv \
 # -t 1 \
-# -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json
+# -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json \
+# -edb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/enzyme_db_extended.json \
+# -rdb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data
 
 if __name__ == '__main__':
     args = parse_args()
@@ -243,7 +258,7 @@ if __name__ == '__main__':
         torch.save(sims, sim_path)
     
     device = 'cuda' if torch.cuda.is_available() and '_extended' not in args.enz_db_path else 'cpu'
-    eval_preds = torch.load(args.pred_path).detach().to(device)
+    eval_preds = load_pred_matrix(args.pred_path).detach().to(device)
     eval_labels = eval_labels.to(device)
     sims = sims.to(device)
     

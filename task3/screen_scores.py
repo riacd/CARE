@@ -1,13 +1,137 @@
 import os
+import json
 import argparse
 import torch
 import pandas as pd
 import numpy as np
 from Bio import pairwise2
-from rxnzyme.data.datasets.base import ignore_label
-from rxnzyme.data.modules.prorxn import get_eval_labels
-from rxnzyme.utils import read_json, write_json, retrieval_metrics, screening_metrics
-from .rxnzyme_eval import get_query_ids, get_pair_ids
+from rdkit.ML.Scoring.Scoring import CalcBEDROC, CalcEnrichment # type: ignore
+
+ignore_label = -1
+
+def read_json(path):
+    with open(path, 'r') as f:
+        data = json.load(f)
+    return data
+
+def write_json(data, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def get_pair_ids(rxn_db_dir, enz_db_path, ids_path):
+    del rxn_db_dir
+    pair_ids = pd.read_csv(
+        ids_path,
+        sep='\t' if ids_path.endswith('.tsv') else ',',
+        usecols=['rxn_id', 'enz_id']
+    )
+    valid_enz_ids = read_json(enz_db_path).keys()
+    pair_ids = pair_ids[pair_ids['enz_id'].isin(valid_enz_ids)]
+    return pair_ids
+
+def get_query_ids(train_ids, test_ids, seed=42):
+    test_rxn_groups = dict(list(test_ids.groupby('rxn_id', sort=False)))
+    train_rxn_groups = dict(list(train_ids.groupby('rxn_id', sort=False)))
+
+    query_ids = []
+    for i, (rxn_id, test_rxn_group) in enumerate(test_rxn_groups.items()):
+        sample_enzs = test_rxn_group['enz_id']
+        if rxn_id in train_rxn_groups:
+            train_pos_enzs = train_rxn_groups[rxn_id]['enz_id']
+            if len(sample_enzs) == 1:
+                sample_enzs = train_pos_enzs
+            else:
+                sample_enzs = sample_enzs.iloc[:int(len(train_pos_enzs) * 0.25)]
+                sample_enzs = pd.concat([train_pos_enzs, sample_enzs])
+        elif len(sample_enzs) < 2:
+            continue
+        else:
+            unseen_enzs = sample_enzs[~sample_enzs.isin(train_ids['enz_id'])]
+            if len(unseen_enzs) > 0:
+                sample_enzs = unseen_enzs
+        query_id = sample_enzs.sample(n=1, random_state=seed).iloc[0]
+        query_ids.append({'rxn_id': rxn_id, 'enz_id': query_id, 'rxn_idx': i})
+
+    query_ids = pd.DataFrame(query_ids)
+    test_ids = test_ids[test_ids['rxn_id'].isin(query_ids['rxn_id'])]
+    print(f'Number of test reactions with multiple enzymes: {len(query_ids)}')
+    return test_ids, query_ids
+
+def get_eval_labels(eval_rxn_enz_ids, eval_rxn_ids, eval_enz_ids, train_rxn_enz_ids=None):
+    rxn_id_to_idx = {rxn_id: idx for idx, rxn_id in enumerate(eval_rxn_ids)}
+    rxn_indices = torch.from_numpy(eval_rxn_enz_ids['rxn_id'].map(rxn_id_to_idx).values)
+    enz_id_to_idx = {enz_id: idx for idx, enz_id in enumerate(eval_enz_ids)}
+    enz_indices = torch.from_numpy(eval_rxn_enz_ids['enz_id'].map(enz_id_to_idx).values)
+
+    labels = torch.zeros((len(rxn_id_to_idx), len(enz_id_to_idx)), dtype=torch.float)
+    labels[rxn_indices, enz_indices] = 1
+
+    if train_rxn_enz_ids is not None:
+        train_rxn_enz_ids = train_rxn_enz_ids[train_rxn_enz_ids['rxn_id'].isin(rxn_id_to_idx.keys())]
+        rxn_indices = torch.from_numpy(train_rxn_enz_ids['rxn_id'].map(rxn_id_to_idx).values)
+        enz_indices = torch.from_numpy(train_rxn_enz_ids['enz_id'].map(enz_id_to_idx).values)
+        labels[rxn_indices, enz_indices] = ignore_label
+
+    return labels, rxn_id_to_idx, enz_id_to_idx
+
+def retrieval_metrics(preds, labels, k=20, num_pos=None, reduce=True, ignore_index=-100):
+    if type(preds) is not torch.Tensor:
+        preds = torch.from_numpy(preds)
+    if type(labels) is not torch.Tensor:
+        labels = torch.from_numpy(labels)
+    labels = labels.to(preds.device)
+
+    label_mask = labels != ignore_index
+    preds = preds.where(label_mask, -1000)
+    labels = labels.where(label_mask, 0)
+
+    indices = preds.topk(k, dim=1).indices
+    topk_labels = labels.gather(dim=1, index=indices)
+
+    num_matches = topk_labels.sum(1)
+    num_pos = labels.sum(1) if num_pos is None else num_pos.to(preds.device)
+    success_rate = (num_matches > 0).float()
+    precision = num_matches / k
+    recall = num_matches / num_pos
+    if reduce:
+        success_rate = success_rate.mean().item()
+        precision = precision.mean().item()
+        recall = recall.mean().item()
+
+    return {
+        f'sr@{k}': success_rate,
+        f'acc@{k}': precision,
+        f'recall@{k}': recall
+    }
+
+def screening_metrics(preds, labels, alpha=85, fraction=0.02, reduce=True, ignore_index=-100):
+    if type(preds) is not torch.Tensor:
+        preds = torch.from_numpy(preds)
+    if type(labels) is not torch.Tensor:
+        labels = torch.from_numpy(labels)
+    labels = labels.to(preds.device)
+
+    label_mask = labels != ignore_index
+    preds = preds.where(label_mask, -1000)
+
+    preds, indices = preds.sort(dim=1, descending=True)
+    labels = labels.gather(dim=1, index=indices)
+
+    bedroc, ef = [], []
+    scores = torch.stack([preds.cpu(), labels.cpu()], dim=-1).double().numpy()
+    num_cdts = label_mask.sum(1).tolist()
+    for i, n in enumerate(num_cdts):
+        bedroc.append(CalcBEDROC(scores[i][:n], col=1, alpha=alpha))
+        ef.append(CalcEnrichment(scores[i][:n], col=1, fractions=[fraction])[0])
+    if reduce:
+        bedroc = sum(bedroc) / preds.size(0)
+        ef = sum(ef) / preds.size(0)
+
+    return {
+        f'bedroc@{alpha}': bedroc,
+        f'ef@{fraction}': ef
+    }
 
 def pairwise_identity(seq1, seq2):
     best_aln = pairwise2.align.globalxx(seq1, seq2)[0]
@@ -58,8 +182,11 @@ def parse_args():
 # python -m scripts.screening.screen_scores -tid train_ids路径 -sid test_ids路径 -pp preds矩阵路径 -t 1 -sp predictions/temp.json
 # 用上面个这个命令来算分
 # 使用 Protein_CUDA121 环境，注意检查环境中 python 解释器链接正确，
-# preds 矩阵路径为 ‘baseline/CARE/data/inference_preds_bs40/rxn_sub_split_original_entries_preds.npy’
-# train, test id 在目录：baseline/CARE/data/rxn_sub_split
+# -pp /mnt/shared-storage-user/huyutong/CARE/data/inference_preds_bs40/enzyme_split_original_entries_preds.npy \
+# -tid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/train_pairs.tsv \
+# -sid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/val_pairs.tsv \
+# -t 1 \
+# -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json
 
 if __name__ == '__main__':
     args = parse_args()

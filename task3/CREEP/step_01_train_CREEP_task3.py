@@ -29,6 +29,7 @@ else:
     CARE_ROOT = REPO_ROOT / "baseline" / "CARE"
 
 CREEP_ROOT = CARE_ROOT / "CREEP"
+TASK3_DATA_ROOT = CARE_ROOT / "data"
 for path in (REPO_ROOT, CREEP_ROOT):
     path_str = str(path)
     if path_str not in sys.path:
@@ -229,10 +230,11 @@ def main():
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--ssl_emb_dim", type=int, default=256)
     parser.add_argument("--split_type", type=str, default="enzyme_split", choices=["enzyme_split", "rxn_sub_split"])
+    parser.add_argument("--data_root", type=str, default=str(TASK3_DATA_ROOT))
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--val_file", type=str, default=None)
-    parser.add_argument("--pair_db_path", type=str, default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "all_pair_data.tsv"))
-    parser.add_argument("--enzyme_db_path", type=str, default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.json"))
+    parser.add_argument("--pair_db_path", type=str, default=None)
+    parser.add_argument("--enzyme_db_path", type=str, default=None)
     parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
     parser.add_argument("--text_backbone_model", type=str, default="SciBERT")
     parser.add_argument("--reaction_backbone_model", type=str, default="rxnfp")
@@ -263,10 +265,15 @@ def main():
     parser.add_argument("--wandb_mode", type=str, default="offline", choices=["offline", "online", "disabled"])
     args = parser.parse_args()
 
+    data_root = Path(args.data_root)
+    if args.pair_db_path is None:
+        args.pair_db_path = str(data_root / "pair_merged_data" / "all_pair_data.tsv")
+    if args.enzyme_db_path is None:
+        args.enzyme_db_path = str(data_root / "pair_merged_data" / "enzyme_db_extended.json")
     if args.train_file is None:
-        args.train_file = str(CARE_ROOT / "task3" / "data" / args.split_type / ("train_pairs.tsv" if args.split_type == "enzyme_split" else "train_reactions.tsv"))
+        args.train_file = str(data_root / args.split_type / ("train_pairs.tsv" if args.split_type == "enzyme_split" else "train_reactions.tsv"))
     if args.val_file is None:
-        args.val_file = str(CARE_ROOT / "task3" / "data" / args.split_type / ("val_pairs.tsv" if args.split_type == "enzyme_split" else "val_reactions.tsv"))
+        args.val_file = str(data_root / args.split_type / ("val_pairs.tsv" if args.split_type == "enzyme_split" else "val_reactions.tsv"))
     if args.wandb_run_name is None:
         args.wandb_run_name = f"creep-task3-{args.split_type}"
 

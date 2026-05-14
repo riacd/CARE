@@ -200,3 +200,5 @@ dmypy.json
 /task3/output/
 /task4/data/
 
+task4/logs/
+task4/run_retrieve_reaction_aliases.pbs

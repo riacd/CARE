@@ -1,2 +1,3 @@
 from CREEP.datasets.dataset_CREEP import SingleModalityDataset, CREEPDatasetMineBatch
 from CREEP.datasets.dataset_task3 import Task3CREEPDataset, Task3PairBatchSampler
+from CREEP.datasets.dataset_task4 import Task4CREEPDataset, Task4PairBatchSampler

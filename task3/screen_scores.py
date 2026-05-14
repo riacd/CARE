@@ -200,7 +200,7 @@ def parse_args():
 # -sid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/val_pairs.tsv \
 # -t 1 \
 # -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json \
-# -edb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/enzyme_db_extended.json \
+# -edb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/enzyme_db.json \
 # -rdb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data
 
 if __name__ == '__main__':

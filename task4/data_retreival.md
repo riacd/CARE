@@ -1,5 +1,45 @@
 # 数据收集
-现在需要为 @task4/data/pair_merged_data/all_pair_data.tsv 中每一个反应寻找到对应的 别名反应 文本，打算使用如下方式
+现在需要为 @data/pair_merged_data/all_pair_data.tsv 中每一个反应寻找到对应的 别名反应 文本，打算使用如下方式
+## 检索逻辑（框架—）
+1. 先找到这条 pair 对应哪个源记录
+  当前有 3 条匹配路径：
+
+  - brenda_by_enz
+      - 先拿 all_pair_data.tsv 里的 (enz_id, std_rxn)。
+      - 在 Brenda 源里按同一个 enz_id 找，命中同一个 std_rxn 就直接用。
+      - 这是最优先路径，因为 Brenda 自带 RXN_TEXT。
+  - rhea_by_enz
+      - 如果 Brenda 没命中，就去 Rhea 源里按同一个 enz_id + std_rxn 找。
+      - 这个路径通常只有 Rhea_ID，没有 RXN_TEXT，后面还要继续补文本。
+  - *_by_std
+      - 如果按 enz_id 都没找到，就退化成只按 std_rxn 在全局源库里找。
+      - 可能命中 Brenda，也可能命中 Rhea。
+      - 这是“同反应全局兜底”，不再要求同一个酶。
+2. 
+找到源记录后，怎么得到 RXN_TEXT
+  当前实际存在 5 条文本路径：
+
+  - 路径 A：直接使用 Brenda 自带 RXN_TEXT
+      - 命中 brenda_by_enz 或 brenda_by_std 时，如果原记录已有 RXN_TEXT，直接写出。
+  - 路径 B：用同一个 std_rxn 的 Brenda 文本补给 Rhea
+      - 如果命中的是 Rhea 记录，但它没有 RXN_TEXT，脚本会先看这个 std_rxn 是否在 Brenda 里出现过带文本的版本。
+  - 路径 C：用 rhea_name_smiles.txt 逐分子翻译
+      - 如果还没有文本，就把 std_rxn 拆成单分子。
+      - 每个 canonical SMILES 去 task4/data/rhea_name_smiles.txt 里查别名。
+      - 全命中时，拼成 A + B = C + D。
+      - 没有全命中，则进入下一路径
+  - 路径 E：按 Rhea_ID 远程补文本
+      - 只有当上一步出现 used_fallback=True 且记录里有 Rhea_ID 时，才会触发。
+3. 
+Rhea_ID 这条远程路径内部，其实又有几层
+  当前代码写的是：
+  - E1：Rhea_ID -> /json -> equation
+      - 仍然优先，直接返回 equation
+  - E2：Rhea_ID -> /json -> left/right -> label
+      - 不再读不存在的 participants
+      - 改为分别读取 left 和 right
+      - 每侧把 label 提出来，拼成 A + B = C + D
+      
 ## 找到每个反应在原始数据库中的索引
 由于文件 @task4/data/pair_merged_data/all_pair_data.tsv 中的所有反应，全部来自于两个数据源
 1. @task4/data/brenda_rxntxt_uniprot_washed.tsv
@@ -11,60 +51,10 @@
 2. Rhea_ID：有的话则有，没有则为NaN
 3. std_rxn：标准反应 SMILES 表达式
 4. enz_id：Uniprot ID
-未匹配数据文件保存如下列：
-1. enz_id
-2. std_rxn
 
 
-检索方式：
-0. 将 @task4/data/brenda_rxntxt_uniprot_washed.tsv 和 @task4/data/cleaned_rhea_uniprot_washed.tsv 以及 @task4/data/pair_merged_data/all_pair_data.tsv 中 mapped_rxn 使用 RDKit 工具删除 atom mapping 序号，并标准化（要求反应物顺序，以及产物顺序也唯一），结果对应新的一列 std_rxn
-1. 根据 Uniprot ID 来检索，将 @task4/data/brenda_rxntxt_uniprot_washed.tsv 和 @task4/data/cleaned_rhea_uniprot_washed.tsv 分别各自转化成 enz_id -> rxn(Rhea_ID/RXN_TEXT, std_rxn) 的一对多映射，保存为字典
-2. 依次使用 @task4/data/pair_merged_data/all_pair_data.tsv 中每条数据 (enz_id, std_rxn) 对应的 enz_id 进行检索
-3. 先使用根据 @task4/data/brenda_rxntxt_uniprot_washed.tsv 构造的字典，使用 enz_id 进行检索得到若干反应，第一个与 std_rxn 匹配的反应数据  (RXN_TEXT, Rhea_ID, std_rxn, enz_id) 放入结果文件中，没有匹配到的原始数据保存到未匹配数据文件中
-4. 使用根据 @task4/data/cleaned_rhea_uniprot_washed.tsv 构造的字典，使用 enz_id 进行检索得到若干反应，第一个与 std_rxn 匹配的反应数据  (RXN_TEXT, Rhea_ID, std_rxn, enz_id) 中，有Rhea_ID，但缺乏RXN_TEXT 数据，下一步就是根据std_rxn构造相应的RXN_TEXT
-5. 对于步骤4中获得的 缺乏RXN_TEXT 数据 的条目以及 未匹配数据文件 中所有条目，使用 @task4/data/rhea_name_smiles.txt 中描述的SMILES到别名到转化方式，将原本的SMILES 序列转化为 别名的反应描述作为 RXN_TEXT 
+步骤：
+1. 将 @task4/data/brenda_rxntxt_uniprot_washed.tsv 和 @task4/data/cleaned_rhea_uniprot_washed.tsv 以及 @task4/data/pair_merged_data/all_pair_data.tsv 中 mapped_rxn 使用 RDKit 工具删除 atom mapping 序号，并标准化（要求反应物顺序，以及产物顺序也唯一），结果对应新的一列 std_rxn
+2. 按照框架进行检索得到 RXN_TEXT
+3. 需要打印处理过程中各环节处理成功的反应数目
 
-## 实现
-已实现脚本：@task4/retrieve_reaction_aliases.py
-
-执行命令：
-```bash
-python task4/retrieve_reaction_aliases.py
-```
-
-脚本按如下规则执行：
-1. 对 Brenda、Rhea、all_pair_data 中的 `mapped_rxn` 使用 RDKit 去除 atom mapping，并将反应物集合、产物集合分别做 canonical SMILES 和字典序排序，得到唯一的 `std_rxn`
-2. 将 Brenda 数据构造成 `enz_id -> [(RXN_TEXT, '', std_rxn, enz_id)]`
-3. 将 Rhea 数据构造成 `enz_id -> [('', Rhea_ID, std_rxn, enz_id)]`
-4. 对 `all_pair_data.tsv` 中每条 `(enz_id, std_rxn)`，优先按 Brenda 的 `(enz_id, std_rxn)` 精确匹配
-5. 若 Brenda 未命中，再按 Rhea 的 `(enz_id, std_rxn)` 精确匹配
-6. 若仍未命中，则按 `std_rxn` 在全局源库中兜底匹配
-7. 若命中的是 Rhea 且 `RXN_TEXT` 为空，则先尝试用同一个 `std_rxn` 在 Brenda 中补 `RXN_TEXT`
-8. 若仍然没有 `RXN_TEXT`，则使用 `rhea_name_smiles.txt` 将 `std_rxn` 拆成单分子并替换成别名，最终拼接为 `reactant1 + reactant2 = product1 + product2` 形式的反应文本
-9. 若某些分子在 `rhea_name_smiles.txt` 中没有别名，则仅对这些分子保留 canonical SMILES，其余分子仍使用别名
-
-## 输出文件
-结果文件：
-1. @task4/data/pair_merged_data/reaction_aliases.tsv
-
-未匹配文件：
-1. @task4/data/pair_merged_data/reaction_aliases_unmatched.tsv
-
-运行元数据：
-1. @task4/data/pair_merged_data/reaction_aliases.metadata.json
-
-## 结果统计
-当前一次完整运行的统计如下：
-1. `all_pair_data.tsv` 共 265,920 条 pair，全部完成匹配
-2. 其中 `brenda_by_enz` 直接命中 34,084 条
-3. 其中 `rhea_by_enz_plus_brenda_text` 通过同反应 Brenda 文本补到 `RXN_TEXT` 的有 1,080 条
-4. 其中 `rhea_by_enz_plus_rhea_name_smiles` 通过 `rhea_name_smiles.txt` 生成 `RXN_TEXT` 的有 225,895 条
-5. 其中 `rhea_by_std_plus_rhea_name_smiles` 通过 `std_rxn` 全局兜底后再生成 `RXN_TEXT` 的有 4,861 条
-6. 使用 `rhea_name_smiles.txt` 生成文本时，169,805 条反应实现了全分子别名覆盖
-7. 使用 `rhea_name_smiles.txt` 生成文本时，60,951 条反应存在部分分子未命中映射，因此局部保留了 canonical SMILES
-8. 最终 265,920 条结果全部带有 `RXN_TEXT`
-9. `reaction_aliases_unmatched.tsv` 当前仅包含表头，说明没有未匹配 pair
-
-## 备注
-1. Rhea 源数据本身不包含 `RXN_TEXT` 列，因此需要第 5 步额外使用 `rhea_name_smiles.txt` 按分子构造反应文本
-2. Brenda 源文件中有 33 行缺少 `Uniprot ID`，这些行不会进入 `(enz_id, std_rxn)` 索引，已记录在 `reaction_aliases.metadata.json`

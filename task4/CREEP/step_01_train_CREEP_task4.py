@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 from transformers import BertModel, T5EncoderModel, T5Tokenizer
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -39,7 +39,7 @@ try:
 except ImportError:
     wandb = None
 
-from CREEP.datasets import Task3CREEPDataset, Task3PairBatchSampler
+from CREEP.datasets import Task4CREEPDataset, Task4PairBatchSampler
 from CREEP.models import AEFacilitatorModel, CREEPModel
 from CREEP.utils.tokenization import SmilesTokenizer
 
@@ -65,6 +65,9 @@ def cycle_index(num, shift):
 
 
 def do_cl(x, y, args):
+    x = x.float()
+    y = y.float()
+
     if args.normalize:
         x = F.normalize(x, dim=-1)
         y = F.normalize(y, dim=-1)
@@ -116,7 +119,6 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
 
     iterator = tqdm(dataloader) if args.verbose else dataloader
     mse_loss = nn.MSELoss()
-    amp_enabled = device.type == "cuda"
     start_time = time.time()
 
     total_loss = 0.0
@@ -128,6 +130,8 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
         batch = move_batch_to_device(batch, device)
         protein_input_ids = batch["protein_sequence_input_ids"]
         protein_attention_mask = batch["protein_sequence_attention_mask"]
+        text_input_ids = batch["text_sequence_input_ids"]
+        text_attention_mask = batch["text_sequence_attention_mask"]
         reaction_input_ids = batch["reaction_sequence_input_ids"]
         reaction_attention_mask = batch["reaction_sequence_attention_mask"]
 
@@ -135,20 +139,38 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(training):
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
-                protein_repr, _, reaction_repr, reaction2protein_repr, protein2reaction_repr = model(
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+                protein_repr, text_repr, reaction_repr, reaction2protein_repr, protein2reaction_repr = model(
                     protein_sequence_input_ids=protein_input_ids,
                     protein_sequence_attention_mask=protein_attention_mask,
+                    text_sequence_input_ids=text_input_ids,
+                    text_sequence_attention_mask=text_attention_mask,
                     reaction_sequence_input_ids=reaction_input_ids,
                     reaction_sequence_attention_mask=reaction_attention_mask,
                 )
 
-                loss_pr, acc_pr = do_cl(protein_repr, reaction_repr, args)
-                loss_rp, acc_rp = do_cl(reaction_repr, protein_repr, args)
-                contrastive_loss = (loss_pr + loss_rp) / 2
-                contrastive_acc = (acc_pr + acc_rp) / 2
+                if args.use_three_modalities:
+                    losses_and_accs = [
+                        do_cl(protein_repr, text_repr, args),
+                        do_cl(text_repr, protein_repr, args),
+                        do_cl(text_repr, reaction_repr, args),
+                        do_cl(protein_repr, reaction_repr, args),
+                        do_cl(reaction_repr, text_repr, args),
+                        do_cl(reaction_repr, protein_repr, args),
+                    ]
+                else:
+                    losses_and_accs = [
+                        do_cl(protein_repr, reaction_repr, args),
+                        do_cl(reaction_repr, protein_repr, args),
+                    ]
 
-                generative_loss = mse_loss(reaction2protein_repr, protein_repr) + mse_loss(
+                contrastive_loss = sum(loss for loss, _ in losses_and_accs) / len(losses_and_accs)
+                contrastive_acc = sum(acc for _, acc in losses_and_accs) / len(losses_and_accs)
+
+                generative_loss = mse_loss(
+                    reaction2protein_repr,
+                    protein_repr,
+                ) + mse_loss(
                     protein2reaction_repr,
                     reaction_repr,
                 )
@@ -179,7 +201,7 @@ def run_epoch(dataloader, model, optimizer, scaler, device, args, training):
 
 
 def build_dataloader(dataset, batch_size, num_batches, num_workers, seed, epoch):
-    sampler = Task3PairBatchSampler(
+    sampler = Task4PairBatchSampler(
         dataset=dataset,
         batch_size=batch_size,
         num_batches=num_batches,
@@ -205,6 +227,8 @@ def init_wandb(args):
         return None
 
     os.environ.setdefault("WANDB_MODE", args.wandb_mode)
+    if args.wandb_api_key:
+        os.environ.setdefault("WANDB_API_KEY", args.wandb_api_key)
     return wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name,
@@ -231,16 +255,27 @@ def main():
     parser.add_argument("--split_type", type=str, default="enzyme_split", choices=["enzyme_split", "rxn_sub_split"])
     parser.add_argument("--train_file", type=str, default=None)
     parser.add_argument("--val_file", type=str, default=None)
-    parser.add_argument("--pair_db_path", type=str, default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "all_pair_data.tsv"))
-    parser.add_argument("--enzyme_db_path", type=str, default=str(CARE_ROOT / "task3" / "data" / "pair_merged_data" / "enzyme_db_extended.json"))
+    parser.add_argument(
+        "--pair_db_path",
+        type=str,
+        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "all_pair_data_with_text.tsv"),
+    )
+    parser.add_argument(
+        "--enzyme_db_path",
+        type=str,
+        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
+    )
     parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
     parser.add_argument("--text_backbone_model", type=str, default="SciBERT")
     parser.add_argument("--reaction_backbone_model", type=str, default="rxnfp")
     parser.add_argument("--protein_max_sequence_len", type=int, default=512)
+    parser.add_argument("--text_max_sequence_len", type=int, default=512)
     parser.add_argument("--reaction_max_sequence_len", type=int, default=512)
-    parser.add_argument("--protein_lr", type=float, default=1e-4)
+    parser.add_argument("--protein_lr", type=float, default=1e-5)
     parser.add_argument("--protein_lr_scale", type=float, default=1.0)
-    parser.add_argument("--reaction_lr", type=float, default=1e-4)
+    parser.add_argument("--text_lr", type=float, default=1e-5)
+    parser.add_argument("--text_lr_scale", type=float, default=0.1)
+    parser.add_argument("--reaction_lr", type=float, default=1e-5)
     parser.add_argument("--reaction_lr_scale", type=float, default=1.0)
     parser.add_argument("--cl_neg_samples", type=int, default=1)
     parser.add_argument("--cl_loss", type=str, default="EBM_NCE", choices=["EBM_NCE", "InfoNCE"])
@@ -248,6 +283,9 @@ def main():
     parser.add_argument("--decay", type=float, default=0.0)
     parser.add_argument("--alpha_contrastive", type=float, default=1.0)
     parser.add_argument("--alpha_generative", type=float, default=0.0)
+    parser.add_argument("--use_three_modalities", dest="use_three_modalities", action="store_true")
+    parser.add_argument("--use_two_modalities", dest="use_three_modalities", action="store_false")
+    parser.set_defaults(use_three_modalities=True)
     parser.add_argument("--normalize", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--num_batches_per_epoch", type=int, default=5000)
@@ -256,19 +294,36 @@ def main():
     parser.add_argument(
         "--preprocessed_rxn_dir",
         type=str,
-        default=str(CARE_ROOT / "runtime" / "task3_preprocessed"),
+        default=str(CARE_ROOT / "runtime" / "task4_preprocessed"),
     )
-    parser.add_argument("--wandb_project", type=str, default="care-task3-creep")
+    parser.add_argument("--wandb_project", type=str, default="care-task4-creep")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--wandb_mode", type=str, default="offline", choices=["offline", "online", "disabled"])
+    parser.add_argument(
+        "--wandb_api_key",
+        type=str,
+        default="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",
+    )
     args = parser.parse_args()
 
     if args.train_file is None:
-        args.train_file = str(CARE_ROOT / "task3" / "data" / args.split_type / ("train_pairs.tsv" if args.split_type == "enzyme_split" else "train_reactions.tsv"))
+        args.train_file = str(
+            CARE_ROOT
+            / "task4"
+            / "data"
+            / args.split_type
+            / ("train_pairs.tsv" if args.split_type == "enzyme_split" else "train_reactions.tsv")
+        )
     if args.val_file is None:
-        args.val_file = str(CARE_ROOT / "task3" / "data" / args.split_type / ("val_pairs.tsv" if args.split_type == "enzyme_split" else "val_reactions.tsv"))
+        args.val_file = str(
+            CARE_ROOT
+            / "task4"
+            / "data"
+            / args.split_type
+            / ("val_pairs.tsv" if args.split_type == "enzyme_split" else "val_reactions.tsv")
+        )
     if args.wandb_run_name is None:
-        args.wandb_run_name = f"creep-task3-{args.split_type}"
+        args.wandb_run_name = f"creep-task4-{args.split_type}"
 
     os.makedirs(args.output_model_dir, exist_ok=True)
     sys.stdout = Logger(os.path.join(args.output_model_dir, "log.txt"), "w")
@@ -284,6 +339,7 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     device = torch.device(f"cuda:{args.device}") if torch.cuda.is_available() else torch.device("cpu")
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     protein_tokenizer = T5Tokenizer.from_pretrained(
         "Rostlab/prot_t5_xl_half_uniref50-enc",
@@ -298,6 +354,11 @@ def main():
     )
     protein_dim = 1024
 
+    text_tokenizer = AutoTokenizer.from_pretrained(
+        "allenai/scibert_scivocab_uncased",
+        cache_dir=str(CREEP_ROOT / "data" / "pretrained_SciBert"),
+        local_files_only=True,
+    )
     text_model = AutoModel.from_pretrained(
         "allenai/scibert_scivocab_uncased",
         cache_dir=str(CREEP_ROOT / "data" / "pretrained_SciBert"),
@@ -329,15 +390,17 @@ def main():
         args.text_backbone_model,
         args.reaction_backbone_model,
     )
-    model.to(device)
+    model = model.to(device)
 
-    train_dataset = Task3CREEPDataset(
+    train_dataset = Task4CREEPDataset(
         split_file=args.train_file,
         pair_db_path=args.pair_db_path,
         enzyme_db_path=args.enzyme_db_path,
         protein_tokenizer=protein_tokenizer,
+        text_tokenizer=text_tokenizer,
         reaction_tokenizer=reaction_tokenizer,
         protein_max_sequence_len=args.protein_max_sequence_len,
+        text_max_sequence_len=args.text_max_sequence_len,
         reaction_max_sequence_len=args.reaction_max_sequence_len,
         preprocessed_dir=args.preprocessed_rxn_dir,
     )
@@ -346,13 +409,15 @@ def main():
 
     val_dataset = None
     if args.val_file:
-        val_dataset = Task3CREEPDataset(
+        val_dataset = Task4CREEPDataset(
             split_file=args.val_file,
             pair_db_path=args.pair_db_path,
             enzyme_db_path=args.enzyme_db_path,
             protein_tokenizer=protein_tokenizer,
+            text_tokenizer=text_tokenizer,
             reaction_tokenizer=reaction_tokenizer,
             protein_max_sequence_len=args.protein_max_sequence_len,
+            text_max_sequence_len=args.text_max_sequence_len,
             reaction_max_sequence_len=args.reaction_max_sequence_len,
             preprocessed_dir=args.preprocessed_rxn_dir,
         )
@@ -361,14 +426,15 @@ def main():
 
     model_param_group = [
         {"params": protein_model.parameters(), "lr": args.protein_lr * args.protein_lr_scale},
+        {"params": text_model.parameters(), "lr": args.text_lr * args.text_lr_scale},
         {"params": reaction_model.parameters(), "lr": args.reaction_lr * args.reaction_lr_scale},
         {"params": protein2latent_model.parameters(), "lr": args.protein_lr * args.protein_lr_scale},
+        {"params": text2latent_model.parameters(), "lr": args.text_lr * args.text_lr_scale},
         {"params": reaction2latent_model.parameters(), "lr": args.reaction_lr * args.reaction_lr_scale},
         {"params": reaction2protein_facilitator_model.parameters(), "lr": args.reaction_lr * args.reaction_lr_scale},
         {"params": protein2reaction_facilitator_model.parameters(), "lr": args.protein_lr * args.protein_lr_scale},
     ]
-    optimizer = optim.AdamW(model_param_group, weight_decay=args.decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+    optimizer = optim.Adam(model_param_group, weight_decay=args.decay)
 
     model_parts = {
         "text": text_model,
@@ -440,7 +506,8 @@ def main():
             "train/contrastive_acc": train_metrics["contrastive_acc"],
             "train/epoch_time_sec": train_metrics["epoch_time_sec"],
             "lr/protein": optimizer.param_groups[0]["lr"],
-            "lr/reaction": optimizer.param_groups[1]["lr"],
+            "lr/text": optimizer.param_groups[1]["lr"],
+            "lr/reaction": optimizer.param_groups[2]["lr"],
         }
         if val_metrics is not None:
             log_payload.update(

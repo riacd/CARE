@@ -29,14 +29,17 @@ benchmark 设计如下
 2. reaction 模态
 3. 文本 模态
 
-最终数据
+#### 文本 模态数据
+文本数据包含两个部分
+1. RXN_TEXT： 原始数据存储在目录 @task4/data/pair_merged_data/reaction_aliases.tsv
+2. EC text：保存在目录 @data/pair_merged_data/rxn_ec_number.tsv 中是 EC number，进一步可以找到 EC text
 
-#### 文本数据收集
+最终输入到模型中的完整文本模态数据就是 TEXT = RXN_TEXT + '\t' + EC text
+#### RXN_TEXT
 已有的数据都是 protein, reaction 的 pair-wise 数据
 文本模态数据收集参考 @task4/data_retreival.md
 
-
-####
+#### EC text
 文件描述如下：
 1. @processed_data/text2EC.csv 描述了 EC number 与 EC text 的对应关系
 

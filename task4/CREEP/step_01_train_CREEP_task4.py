@@ -29,7 +29,7 @@ else:
     CARE_ROOT = REPO_ROOT / "baseline" / "CARE"
 
 CREEP_ROOT = CARE_ROOT / "CREEP"
-for path in (REPO_ROOT, CREEP_ROOT):
+for path in (REPO_ROOT, CARE_ROOT, CREEP_ROOT):
     path_str = str(path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
@@ -56,6 +56,20 @@ class Logger:
     def flush(self):
         self.terminal.flush()
         self.log.flush()
+
+
+def resolve_hf_local_model_dir(cache_root, model_id):
+    cache_root = Path(cache_root)
+    if (cache_root / "config.json").exists():
+        return str(cache_root)
+
+    repo_dir = cache_root / f"models--{model_id.replace('/', '--')}"
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.exists():
+        snapshot_dirs = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshot_dirs:
+            return str(snapshot_dirs[-1])
+    return str(cache_root)
 
 
 def cycle_index(num, shift):
@@ -258,12 +272,27 @@ def main():
     parser.add_argument(
         "--pair_db_path",
         type=str,
-        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "all_pair_data_with_text.tsv"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "all_pair_data.tsv"),
     )
     parser.add_argument(
         "--enzyme_db_path",
         type=str,
-        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
+    )
+    parser.add_argument(
+        "--reaction_aliases_path",
+        type=str,
+        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "reaction_aliases.tsv"),
+    )
+    parser.add_argument(
+        "--rxn_ec_number_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "rxn_ec_number.tsv"),
+    )
+    parser.add_argument(
+        "--ec_text_path",
+        type=str,
+        default=str(CARE_ROOT / "processed_data" / "text2EC.csv"),
     )
     parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
     parser.add_argument("--text_backbone_model", type=str, default="SciBERT")
@@ -309,7 +338,6 @@ def main():
     if args.train_file is None:
         args.train_file = str(
             CARE_ROOT
-            / "task4"
             / "data"
             / args.split_type
             / ("train_pairs.tsv" if args.split_type == "enzyme_split" else "train_reactions.tsv")
@@ -317,7 +345,6 @@ def main():
     if args.val_file is None:
         args.val_file = str(
             CARE_ROOT
-            / "task4"
             / "data"
             / args.split_type
             / ("val_pairs.tsv" if args.split_type == "enzyme_split" else "val_reactions.tsv")
@@ -341,27 +368,28 @@ def main():
     device = torch.device(f"cuda:{args.device}") if torch.cuda.is_available() else torch.device("cpu")
     scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
+    protein_cache_dir = CREEP_ROOT / "data" / "pretrained_ProtT5"
+    protein_model_dir = resolve_hf_local_model_dir(protein_cache_dir, "Rostlab/prot_t5_xl_half_uniref50-enc")
     protein_tokenizer = T5Tokenizer.from_pretrained(
-        "Rostlab/prot_t5_xl_half_uniref50-enc",
+        protein_model_dir,
         do_lower_case=False,
-        cache_dir=str(CREEP_ROOT / "data" / "pretrained_ProtT5"),
         local_files_only=True,
     )
     protein_model = T5EncoderModel.from_pretrained(
-        "Rostlab/prot_t5_xl_half_uniref50-enc",
-        cache_dir=str(CREEP_ROOT / "data" / "pretrained_ProtT5"),
+        protein_model_dir,
         local_files_only=True,
     )
     protein_dim = 1024
 
+    text_cache_dir = CREEP_ROOT / "data" / "pretrained_SciBert"
+    text_model_dir = resolve_hf_local_model_dir(text_cache_dir, "allenai/scibert_scivocab_uncased")
     text_tokenizer = AutoTokenizer.from_pretrained(
-        "allenai/scibert_scivocab_uncased",
-        cache_dir=str(CREEP_ROOT / "data" / "pretrained_SciBert"),
+        text_model_dir,
         local_files_only=True,
+        use_fast=False,
     )
     text_model = AutoModel.from_pretrained(
-        "allenai/scibert_scivocab_uncased",
-        cache_dir=str(CREEP_ROOT / "data" / "pretrained_SciBert"),
+        text_model_dir,
         local_files_only=True,
     )
     text_dim = 768
@@ -403,6 +431,9 @@ def main():
         text_max_sequence_len=args.text_max_sequence_len,
         reaction_max_sequence_len=args.reaction_max_sequence_len,
         preprocessed_dir=args.preprocessed_rxn_dir,
+        reaction_aliases_path=args.reaction_aliases_path,
+        rxn_ec_number_path=args.rxn_ec_number_path,
+        ec_text_path=args.ec_text_path,
     )
     dump_stats(args.output_model_dir, "train", train_dataset.stats)
     print("train dataset stats", train_dataset.stats)
@@ -420,6 +451,9 @@ def main():
             text_max_sequence_len=args.text_max_sequence_len,
             reaction_max_sequence_len=args.reaction_max_sequence_len,
             preprocessed_dir=args.preprocessed_rxn_dir,
+            reaction_aliases_path=args.reaction_aliases_path,
+            rxn_ec_number_path=args.rxn_ec_number_path,
+            ec_text_path=args.ec_text_path,
         )
         dump_stats(args.output_model_dir, "val", val_dataset.stats)
         print("val dataset stats", val_dataset.stats)

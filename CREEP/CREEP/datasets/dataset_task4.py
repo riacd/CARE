@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -9,17 +10,49 @@ from torch.utils.data import Dataset, Sampler
 
 from CREEP.datasets.dataset_CREEP import encode_sequence
 
-RDLogger.DisableLog("rdApp.warning")
-TASK4_RXN_PREPROCESS_VERSION = "v1"
+RDLogger.DisableLog("rdApp.*")
+TASK4_RXN_PREPROCESS_VERSION = "v4_rxn_text_plus_ec_text"
+ATOM_MAP_PATTERN = re.compile(r":\d+(?=])")
 
 
-def _unmap_smiles(smiles):
+def _normalize_text_value(value):
+    if pd.isna(value):
+        return ""
+    value = str(value)
+    return value.strip().strip('"')
+
+
+def _remove_atom_map_annotations(smiles):
+    return ATOM_MAP_PATTERN.sub("", str(smiles).strip())
+
+
+def _canonicalize_molecule(smiles):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
-        return None
+        raise ValueError(f"invalid molecule smiles: {smiles}")
     for atom in mol.GetAtoms():
         atom.SetAtomMapNum(0)
-    return Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(mol)))
+        if atom.HasProp("molAtomMapNumber"):
+            atom.ClearProp("molAtomMapNumber")
+    return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+
+
+def _canonicalize_molecule_tolerant(smiles):
+    try:
+        return _canonicalize_molecule(smiles)
+    except Exception:
+        unmapped_smiles = _remove_atom_map_annotations(smiles)
+        try:
+            return _canonicalize_molecule(unmapped_smiles)
+        except Exception:
+            return unmapped_smiles
+
+
+def _canonicalize_side(side):
+    parts = [part.strip() for part in str(side).split(".") if part.strip()]
+    canonical_parts = [_canonicalize_molecule_tolerant(part) for part in parts]
+    canonical_parts.sort()
+    return ".".join(canonical_parts)
 
 
 def _unmap_reaction(mapped_rxn):
@@ -28,11 +61,7 @@ def _unmap_reaction(mapped_rxn):
 
     reactants, products = mapped_rxn.split(">>", 1)
     try:
-        reactants = _unmap_smiles(reactants)
-        products = _unmap_smiles(products)
-        if reactants is None or products is None:
-            return None
-        return f"{reactants}>>{products}"
+        return f"{_canonicalize_side(reactants)}>>{_canonicalize_side(products)}"
     except Exception:
         return None
 
@@ -42,23 +71,32 @@ def _load_enzyme_db(enzyme_db_path):
         return json.load(f)
 
 
-def _build_preprocessed_rxn_key(pair_db_path):
+def _build_preprocessed_rxn_key(pair_db_path, dependency_paths=None):
     digest = hashlib.sha256()
     path = Path(pair_db_path)
     stat = path.stat()
     digest.update(str(path.resolve()).encode("utf-8"))
     digest.update(str(stat.st_size).encode("utf-8"))
     digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+    for dependency_path in dependency_paths or []:
+        dependency_path = Path(dependency_path)
+        if not dependency_path.exists():
+            digest.update(f"{dependency_path}:missing".encode("utf-8"))
+            continue
+        dep_stat = dependency_path.stat()
+        digest.update(str(dependency_path.resolve()).encode("utf-8"))
+        digest.update(str(dep_stat.st_size).encode("utf-8"))
+        digest.update(str(dep_stat.st_mtime_ns).encode("utf-8"))
     digest.update(TASK4_RXN_PREPROCESS_VERSION.encode("utf-8"))
     return digest.hexdigest()[:16]
 
 
-def _resolve_preprocessed_rxn_path(preprocessed_dir, pair_db_path):
+def _resolve_preprocessed_rxn_path(preprocessed_dir, pair_db_path, dependency_paths=None):
     if preprocessed_dir is None:
         return None
     preprocessed_dir = Path(preprocessed_dir)
     pair_db_path = Path(pair_db_path)
-    preprocess_key = _build_preprocessed_rxn_key(pair_db_path)
+    preprocess_key = _build_preprocessed_rxn_key(pair_db_path, dependency_paths=dependency_paths)
     return preprocessed_dir / f"{pair_db_path.stem}_deaam_{preprocess_key}.tsv"
 
 
@@ -69,14 +107,48 @@ def _first_present_column(df, candidates):
     return None
 
 
-def _normalize_text_value(value):
-    if pd.isna(value):
+def _load_reaction_aliases(alias_path):
+    alias_path = Path(alias_path)
+    alias_df = pd.read_csv(alias_path, sep="\t")
+    alias_df = alias_df.rename(columns={"RXN_TEXT": "rxn_text"})
+    alias_df["rxn_text"] = alias_df["rxn_text"].map(_normalize_text_value)
+    keep_columns = [column for column in ["enz_id", "std_rxn", "rxn_text", "Rhea_ID"] if column in alias_df.columns]
+    alias_df = alias_df[keep_columns].drop_duplicates(["enz_id", "std_rxn"]).reset_index(drop=True)
+    return alias_df
+
+
+def _load_rxn_ec_map(rxn_ec_number_path, ec_text_path):
+    rxn_ec_df = pd.read_csv(rxn_ec_number_path, sep="\t")
+    rxn_ec_df["EC number"] = rxn_ec_df["EC number"].fillna("").astype(str).str.strip()
+
+    ec_text_df = pd.read_csv(ec_text_path)
+    ec_text_df = ec_text_df[["EC number", "Text"]].copy()
+    ec_text_df["EC number"] = ec_text_df["EC number"].fillna("").astype(str).str.strip()
+    ec_text_df["Text"] = ec_text_df["Text"].map(_normalize_text_value)
+
+    rxn_ec_df = rxn_ec_df.merge(ec_text_df, on="EC number", how="left")
+    rxn_ec_df = rxn_ec_df.rename(columns={"EC number": "ec_number", "Text": "ec_text"})
+    rxn_ec_df["ec_text"] = rxn_ec_df["ec_text"].map(_normalize_text_value)
+    return rxn_ec_df[["rxn_id", "ec_number", "ec_text"]].drop_duplicates(["rxn_id"]).reset_index(drop=True)
+
+
+def _compose_task4_text(rxn_text, ec_text, ec_number):
+    rxn_text = _normalize_text_value(rxn_text)
+    ec_text = _normalize_text_value(ec_text)
+    _ = ec_number
+    if not rxn_text and not ec_text:
         return ""
-    value = str(value)
-    return value.strip().strip('"')
+    return f"{rxn_text}\t{ec_text}"
 
 
-def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_dir=None):
+def _load_or_preprocess_pair_db(
+    pair_db_path,
+    enzyme_db_path=None,
+    preprocessed_dir=None,
+    reaction_aliases_path=None,
+    rxn_ec_number_path=None,
+    ec_text_path=None,
+):
     pair_db_path = Path(pair_db_path)
     pair_db = pd.read_csv(pair_db_path, sep="\t")
 
@@ -86,7 +158,16 @@ def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_
         raise ValueError(f"pair db missing required columns: {sorted(missing_required)}")
 
     pair_db = pair_db.drop_duplicates(["rxn_id", "enz_id"]).reset_index(drop=True)
-    preprocessed_rxn_path = _resolve_preprocessed_rxn_path(preprocessed_dir, pair_db_path)
+    dependency_paths = [
+        path
+        for path in [reaction_aliases_path, rxn_ec_number_path, ec_text_path, enzyme_db_path]
+        if path is not None
+    ]
+    preprocessed_rxn_path = _resolve_preprocessed_rxn_path(
+        preprocessed_dir,
+        pair_db_path,
+        dependency_paths=dependency_paths,
+    )
 
     if preprocessed_rxn_path is not None and preprocessed_rxn_path.exists():
         print(f"Loaded task4 de-AAM reactions from {preprocessed_rxn_path}")
@@ -96,7 +177,7 @@ def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_
         return processed
 
     reaction_column = _first_present_column(pair_db, ["reaction", "reaction_y", "reaction_x"])
-    sequence_column = _first_present_column(pair_db, ["sequence"])
+    sequence_column = _first_present_column(pair_db, ["sequence", "Enzyme Seq"])
     text_column = _first_present_column(pair_db, ["text", "iupac_text", "ec_text"])
 
     if reaction_column is not None:
@@ -105,6 +186,7 @@ def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_
         pair_db["reaction"] = pair_db["mapped_rxn"].map(_unmap_reaction)
     else:
         pair_db["reaction"] = None
+    pair_db["std_rxn"] = pair_db["reaction"]
 
     if sequence_column is None and enzyme_db_path is not None:
         enzyme_db = _load_enzyme_db(enzyme_db_path)
@@ -114,14 +196,46 @@ def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_
     else:
         pair_db["sequence"] = None
 
-    if text_column is not None:
+    if reaction_aliases_path is not None:
+        alias_df = _load_reaction_aliases(reaction_aliases_path)
+        pair_db = pair_db.merge(alias_df, on=["enz_id", "std_rxn"], how="left")
+    else:
+        pair_db["rxn_text"] = ""
+
+    if rxn_ec_number_path is not None and ec_text_path is not None:
+        rxn_ec_df = _load_rxn_ec_map(rxn_ec_number_path, ec_text_path)
+        pair_db = pair_db.merge(rxn_ec_df, on="rxn_id", how="left")
+    else:
+        pair_db["ec_number"] = ""
+        pair_db["ec_text"] = ""
+
+    pair_db["rxn_text"] = pair_db.get("rxn_text", "").map(_normalize_text_value)
+    pair_db["ec_number"] = pair_db.get("ec_number", "").fillna("").astype(str).str.strip()
+    pair_db["ec_text"] = pair_db.get("ec_text", "").map(_normalize_text_value)
+
+    if text_column is not None and "text" in pair_db.columns:
         pair_db["text"] = pair_db[text_column].map(_normalize_text_value)
     else:
-        pair_db["text"] = ""
+        pair_db["text"] = pair_db.apply(
+            lambda row: _compose_task4_text(row.get("rxn_text", ""), row.get("ec_text", ""), row.get("ec_number", "")),
+            axis=1,
+        )
 
     keep_columns = [
         column
-        for column in ["rxn_id", "enz_id", "mapped_rxn", "reaction", "sequence", "ec_number", "ec_text", "iupac_text", "text"]
+        for column in [
+            "rxn_id",
+            "enz_id",
+            "mapped_rxn",
+            "std_rxn",
+            "reaction",
+            "sequence",
+            "ec_number",
+            "ec_text",
+            "rxn_text",
+            "iupac_text",
+            "text",
+        ]
         if column in pair_db.columns
     ]
     pair_db = pair_db[keep_columns].copy()
@@ -134,7 +248,15 @@ def _load_or_preprocess_pair_db(pair_db_path, enzyme_db_path=None, preprocessed_
     return pair_db
 
 
-def load_task4_pairs(split_file, pair_db_path, enzyme_db_path=None, preprocessed_dir=None):
+def load_task4_pairs(
+    split_file,
+    pair_db_path,
+    enzyme_db_path=None,
+    preprocessed_dir=None,
+    reaction_aliases_path=None,
+    rxn_ec_number_path=None,
+    ec_text_path=None,
+):
     split_file = Path(split_file)
     pairs = pd.read_csv(split_file, sep="\t")
 
@@ -159,9 +281,12 @@ def load_task4_pairs(split_file, pair_db_path, enzyme_db_path=None, preprocessed
             pair_db_path,
             enzyme_db_path=enzyme_db_path,
             preprocessed_dir=preprocessed_dir,
+            reaction_aliases_path=reaction_aliases_path,
+            rxn_ec_number_path=rxn_ec_number_path,
+            ec_text_path=ec_text_path,
         )
         merge_columns = ["rxn_id", "enz_id"]
-        for column in ["reaction", "sequence", "text", "ec_number", "ec_text", "iupac_text", "mapped_rxn"]:
+        for column in ["reaction", "sequence", "text", "ec_number", "ec_text", "rxn_text", "iupac_text", "mapped_rxn", "std_rxn"]:
             if column in pair_db.columns:
                 merge_columns.append(column)
         pairs = pairs.merge(
@@ -208,6 +333,9 @@ class Task4CREEPDataset(Dataset):
         text_max_sequence_len,
         reaction_max_sequence_len,
         preprocessed_dir=None,
+        reaction_aliases_path=None,
+        rxn_ec_number_path=None,
+        ec_text_path=None,
     ):
         self.protein_tokenizer = protein_tokenizer
         self.text_tokenizer = text_tokenizer
@@ -220,6 +348,9 @@ class Task4CREEPDataset(Dataset):
             pair_db_path,
             enzyme_db_path=enzyme_db_path,
             preprocessed_dir=preprocessed_dir,
+            reaction_aliases_path=reaction_aliases_path,
+            rxn_ec_number_path=rxn_ec_number_path,
+            ec_text_path=ec_text_path,
         )
 
     def __getitem__(self, index):

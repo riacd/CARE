@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -28,8 +29,14 @@ DEFAULT_RHEA_CACHE_PATH = DEFAULT_DATA_DIR / "pair_merged_data" / "rhea_alias_ca
 csv.field_size_limit(sys.maxsize)
 RDLogger.DisableLog("rdApp.*")
 
+ATOM_MAP_PATTERN = re.compile(r":\d+(?=])")
 
-def canonicalize_molecule(smiles: str) -> str:
+
+def remove_atom_map_annotations(smiles: str) -> str:
+    return ATOM_MAP_PATTERN.sub("", smiles.strip())
+
+
+def canonicalize_molecule_strict(smiles: str) -> str:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"invalid molecule smiles: {smiles}")
@@ -40,18 +47,37 @@ def canonicalize_molecule(smiles: str) -> str:
     return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
 
 
-def canonicalize_side(side: str) -> str:
+def canonicalize_molecule(smiles: str) -> tuple[str, str]:
+    try:
+        return canonicalize_molecule_strict(smiles), "rdkit"
+    except Exception:  # noqa: BLE001
+        unmapped_smiles = remove_atom_map_annotations(smiles)
+        try:
+            return canonicalize_molecule_strict(unmapped_smiles), "rdkit_after_unmap"
+        except Exception:  # noqa: BLE001
+            return unmapped_smiles, "raw_unmapped_fragment"
+
+
+def canonicalize_side(side: str) -> tuple[str, Counter]:
     parts = [part.strip() for part in side.split(".") if part.strip()]
-    canonical_parts = sorted(canonicalize_molecule(part) for part in parts)
-    return ".".join(canonical_parts)
+    canonical_parts = []
+    mode_counts = Counter()
+    for part in parts:
+        canonical_part, mode = canonicalize_molecule(part)
+        canonical_parts.append(canonical_part)
+        mode_counts[mode] += 1
+    canonical_parts.sort()
+    return ".".join(canonical_parts), mode_counts
 
 
-def canonicalize_reaction(rxn_smiles: str) -> str:
+def canonicalize_reaction(rxn_smiles: str) -> tuple[str, Counter]:
     parts = rxn_smiles.strip().split(">>")
     if len(parts) != 2:
         raise ValueError(f"invalid reaction smiles: {rxn_smiles}")
     reactants, products = parts
-    return f"{canonicalize_side(reactants)}>>{canonicalize_side(products)}"
+    reactant_side, reactant_modes = canonicalize_side(reactants)
+    product_side, product_modes = canonicalize_side(products)
+    return f"{reactant_side}>>{product_side}", reactant_modes + product_modes
 
 
 def render_reaction_text(std_rxn: str, molecule_name_by_smiles: dict[str, str]) -> tuple[str, bool]:
@@ -95,7 +121,7 @@ def normalize_equation_text(equation: str) -> str:
     return text.replace("<=>", "=").replace("=>", "=").strip()
 
 
-def load_json_cache(path: Path) -> dict[str, str]:
+def load_json_cache(path: Path) -> dict:
     if not path.exists():
         return {}
     try:
@@ -105,7 +131,14 @@ def load_json_cache(path: Path) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {str(key): clean_value(str(value)) for key, value in data.items()}
+    return data
+
+
+def normalize_cache_bucket(data: dict, key: str) -> dict[str, str]:
+    bucket = data.get(key, {})
+    if not isinstance(bucket, dict):
+        return {}
+    return {str(bucket_key): clean_value(str(bucket_value)) for bucket_key, bucket_value in bucket.items()}
 
 
 def http_get_text(url: str, timeout: float) -> str:
@@ -114,7 +147,7 @@ def http_get_text(url: str, timeout: float) -> str:
         return response.read().decode("utf-8")
 
 
-def fetch_chebi_name(chebi_id: str, timeout: float) -> str:
+def fetch_chebi_name_from_web(chebi_id: str, timeout: float) -> str:
     query = parse.urlencode({"chebiId": chebi_id})
     url = f"https://www.ebi.ac.uk/webservices/chebi/2.0/test/getCompleteEntity?{query}"
     xml_text = http_get_text(url, timeout)
@@ -126,7 +159,60 @@ def fetch_chebi_name(chebi_id: str, timeout: float) -> str:
     return ""
 
 
-def get_rhea_entry_name(entry: dict, timeout: float) -> str:
+class WebCache:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        data = load_json_cache(path)
+        self.rhea_text = normalize_cache_bucket(data, "rhea_text")
+        self.rhea_miss = normalize_cache_bucket(data, "rhea_miss")
+        self.chebi_name = normalize_cache_bucket(data, "chebi_name")
+        self.chebi_miss = normalize_cache_bucket(data, "chebi_miss")
+        self.updated = False
+
+    def save(self) -> None:
+        if not self.updated:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "rhea_text": self.rhea_text,
+            "rhea_miss": self.rhea_miss,
+            "chebi_name": self.chebi_name,
+            "chebi_miss": self.chebi_miss,
+        }
+        with self.path.open("w") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False, sort_keys=True)
+
+
+class ChebiNameResolver:
+    def __init__(self, web_cache: WebCache, timeout: float) -> None:
+        self.web_cache = web_cache
+        self.timeout = timeout
+
+    def resolve(self, chebi_id: str) -> tuple[str, str]:
+        normalized_id = clean_value(chebi_id)
+        if not normalized_id:
+            return "", "missing_chebi_id"
+        cached = clean_value(self.web_cache.chebi_name.get(normalized_id, ""))
+        if cached:
+            return cached, "cache"
+        if normalized_id in self.web_cache.chebi_miss:
+            return "", self.web_cache.chebi_miss[normalized_id]
+        try:
+            name = fetch_chebi_name_from_web(normalized_id, self.timeout)
+        except Exception:  # noqa: BLE001
+            self.web_cache.chebi_miss[normalized_id] = "fetch_failed"
+            self.web_cache.updated = True
+            return "", "fetch_failed"
+        if not name:
+            self.web_cache.chebi_miss[normalized_id] = "empty_response"
+            self.web_cache.updated = True
+            return "", "empty_response"
+        self.web_cache.chebi_name[normalized_id] = name
+        self.web_cache.updated = True
+        return name, "api"
+
+
+def get_rhea_entry_name(entry: dict, chebi_name_resolver: ChebiNameResolver) -> str:
     name = clean_value(entry.get("label", ""))
     if name:
         return name
@@ -135,24 +221,29 @@ def get_rhea_entry_name(entry: dict, timeout: float) -> str:
     chebi_id = clean_value(entry.get("id", ""))
     if chebi_prefix == "chebi" and chebi_id:
         try:
-            return fetch_chebi_name(f"CHEBI:{chebi_id}", timeout)
+            chebi_name, _ = chebi_name_resolver.resolve(f"CHEBI:{chebi_id}")
+            return chebi_name
         except Exception:  # noqa: BLE001
             return ""
     return ""
 
 
-def build_rhea_side_expression(entries: list[dict], timeout: float) -> list[str]:
+def build_rhea_side_expression(entries: list[dict], chebi_name_resolver: ChebiNameResolver) -> list[str]:
     names = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        name = get_rhea_entry_name(entry, timeout)
+        name = get_rhea_entry_name(entry, chebi_name_resolver)
         if name:
             names.append(name)
     return names
 
 
-def fetch_rhea_reaction_text(rhea_id: str, timeout: float) -> str:
+def fetch_rhea_reaction_text_from_web(
+    rhea_id: str,
+    timeout: float,
+    chebi_name_resolver: ChebiNameResolver,
+) -> str:
     normalized_id = normalize_rhea_id(rhea_id)
     if not normalized_id:
         return ""
@@ -163,8 +254,8 @@ def fetch_rhea_reaction_text(rhea_id: str, timeout: float) -> str:
     if equation_text:
         return equation_text
 
-    left_names = build_rhea_side_expression(payload.get("left", []), timeout)
-    right_names = build_rhea_side_expression(payload.get("right", []), timeout)
+    left_names = build_rhea_side_expression(payload.get("left", []), chebi_name_resolver)
+    right_names = build_rhea_side_expression(payload.get("right", []), chebi_name_resolver)
 
     if left_names and right_names:
         return f"{' + '.join(left_names)} = {' + '.join(right_names)}".strip()
@@ -174,43 +265,44 @@ def fetch_rhea_reaction_text(rhea_id: str, timeout: float) -> str:
 
 
 class RheaAliasResolver:
-    def __init__(self, cache_path: Path, timeout: float) -> None:
-        self.cache_path = cache_path
+    def __init__(self, web_cache: WebCache, chebi_name_resolver: ChebiNameResolver, timeout: float) -> None:
+        self.web_cache = web_cache
+        self.chebi_name_resolver = chebi_name_resolver
         self.timeout = timeout
-        self.cache = load_json_cache(cache_path)
-        self.miss_cache = {}
-        self.updated = False
 
     def resolve(self, rhea_id: str) -> tuple[str, str]:
         normalized_id = normalize_rhea_id(rhea_id)
         if not normalized_id:
             return "", "missing_rhea_id"
-        cached = clean_value(self.cache.get(normalized_id, ""))
+        cached = clean_value(self.web_cache.rhea_text.get(normalized_id, ""))
         if cached:
             return cached, "cache"
-        if normalized_id in self.miss_cache:
-            return "", self.miss_cache[normalized_id]
+        if normalized_id in self.web_cache.rhea_miss:
+            return "", self.web_cache.rhea_miss[normalized_id]
         try:
-            text = fetch_rhea_reaction_text(normalized_id, self.timeout)
+            text = fetch_rhea_reaction_text_from_web(
+                normalized_id,
+                self.timeout,
+                self.chebi_name_resolver,
+            )
         except (error.URLError, TimeoutError, ValueError, json.JSONDecodeError, ElementTree.ParseError):
-            self.miss_cache[normalized_id] = "fetch_failed"
+            self.web_cache.rhea_miss[normalized_id] = "fetch_failed"
+            self.web_cache.updated = True
             return "", "fetch_failed"
         except Exception:  # noqa: BLE001
-            self.miss_cache[normalized_id] = "fetch_failed"
+            self.web_cache.rhea_miss[normalized_id] = "fetch_failed"
+            self.web_cache.updated = True
             return "", "fetch_failed"
         if not text:
-            self.miss_cache[normalized_id] = "empty_response"
+            self.web_cache.rhea_miss[normalized_id] = "empty_response"
+            self.web_cache.updated = True
             return "", "empty_response"
-        self.cache[normalized_id] = text
-        self.updated = True
+        self.web_cache.rhea_text[normalized_id] = text
+        self.web_cache.updated = True
         return text, "api"
 
     def save(self) -> None:
-        if not self.updated:
-            return
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.cache_path.open("w") as handle:
-            json.dump(self.cache, handle, indent=2, ensure_ascii=False, sort_keys=True)
+        self.web_cache.save()
 
 
 def clean_value(value: str) -> str:
@@ -226,7 +318,12 @@ def split_uniprot_ids(value: str) -> list[str]:
     return [item.strip() for item in clean_value(value).split(";") if item.strip()]
 
 
-def read_rhea_name_smiles(path: Path) -> dict[str, str]:
+def record_canonicalization_stats(stats: Counter, source_name: str, mode_counts: Counter) -> None:
+    for mode, count in mode_counts.items():
+        stats[f"{source_name}_molecule_{mode}"] += count
+
+
+def read_rhea_name_smiles(path: Path, stats: Counter) -> dict[str, str]:
     molecule_name_by_smiles = {}
     with path.open(newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
@@ -235,15 +332,13 @@ def read_rhea_name_smiles(path: Path) -> dict[str, str]:
             smiles = clean_value(row.get("SMILES", ""))
             if not name or not smiles:
                 continue
-            try:
-                canonical_smiles = canonicalize_molecule(smiles)
-            except Exception:  # noqa: BLE001
-                continue
+            canonical_smiles, mode = canonicalize_molecule(smiles)
+            stats[f"rhea_name_smiles_molecule_{mode}"] += 1
             molecule_name_by_smiles.setdefault(canonical_smiles, name)
     return molecule_name_by_smiles
 
 
-def read_source_records(source_name: str, path: Path) -> tuple[list[dict], list[dict]]:
+def read_source_records(source_name: str, path: Path, stats: Counter) -> tuple[list[dict], list[dict]]:
     records = []
     failures = []
     with path.open(newline="") as handle:
@@ -254,10 +349,11 @@ def read_source_records(source_name: str, path: Path) -> tuple[list[dict], list[
                 failures.append({"source": source_name, "row_idx": row_idx, "reason": "missing mapped_rxn"})
                 continue
             try:
-                std_rxn = canonicalize_reaction(raw_rxn)
+                std_rxn, mode_counts = canonicalize_reaction(raw_rxn)
             except Exception as exc:  # noqa: BLE001
                 failures.append({"source": source_name, "row_idx": row_idx, "reason": str(exc)})
                 continue
+            record_canonicalization_stats(stats, source_name, mode_counts)
 
             if source_name == "brenda":
                 enz_ids = split_uniprot_ids(row.get("Uniprot ID", ""))
@@ -403,17 +499,18 @@ def main() -> None:
     parser.add_argument("--rhea-timeout", type=float, default=10.0)
     args = parser.parse_args()
 
-    brenda_records, brenda_failures = read_source_records("brenda", args.brenda_path)
-    rhea_records, rhea_failures = read_source_records("rhea", args.rhea_path)
-    molecule_name_by_smiles = read_rhea_name_smiles(args.rhea_name_smiles_path)
-    rhea_alias_resolver = RheaAliasResolver(args.rhea_cache_path, args.rhea_timeout)
-
+    stats = Counter()
+    brenda_records, brenda_failures = read_source_records("brenda", args.brenda_path, stats)
+    rhea_records, rhea_failures = read_source_records("rhea", args.rhea_path, stats)
+    molecule_name_by_smiles = read_rhea_name_smiles(args.rhea_name_smiles_path, stats)
+    web_cache = WebCache(args.rhea_cache_path)
+    chebi_name_resolver = ChebiNameResolver(web_cache, args.rhea_timeout)
+    rhea_alias_resolver = RheaAliasResolver(web_cache, chebi_name_resolver, args.rhea_timeout)
     brenda_by_enz, rhea_by_enz, best_by_std, brenda_text_by_std = build_source_indexes(
         brenda_records,
         rhea_records,
     )
 
-    stats = Counter()
     failure_rows = brenda_failures + rhea_failures
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -456,11 +553,12 @@ def main() -> None:
                 continue
 
             try:
-                std_rxn = canonicalize_reaction(raw_rxn)
+                std_rxn, mode_counts = canonicalize_reaction(raw_rxn)
             except Exception as exc:  # noqa: BLE001
                 stats["pair_row_failures"] += 1
                 failure_rows.append({"source": "pair", "row_idx": row_idx, "reason": str(exc)})
                 continue
+            record_canonicalization_stats(stats, "pair", mode_counts)
 
             matched_record, match_type = find_matching_record(
                 enz_id,

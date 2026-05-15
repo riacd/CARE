@@ -282,7 +282,7 @@ def main():
     parser.add_argument(
         "--reaction_aliases_path",
         type=str,
-        default=str(CARE_ROOT / "task4" / "data" / "pair_merged_data" / "reaction_aliases.tsv"),
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "reaction_aliases.tsv"),
     )
     parser.add_argument(
         "--rxn_ec_number_path",

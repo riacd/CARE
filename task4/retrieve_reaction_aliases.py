@@ -20,10 +20,10 @@ DEFAULT_PAIR_PATH = CARE_ROOT / "data" / "pair_merged_data" / "all_pair_data.tsv
 DEFAULT_BRENDA_PATH = DEFAULT_DATA_DIR / "brenda_rxntxt_uniprot_washed.tsv"
 DEFAULT_RHEA_PATH = DEFAULT_DATA_DIR / "cleaned_rhea_uniprot_washed.tsv"
 DEFAULT_RHEA_NAME_SMILES_PATH = DEFAULT_DATA_DIR / "rhea_name_smiles.txt"
-DEFAULT_OUTPUT_PATH = DEFAULT_DATA_DIR / "pair_merged_data" / "reaction_aliases.tsv"
-DEFAULT_UNMATCHED_PATH = DEFAULT_DATA_DIR / "pair_merged_data" / "reaction_aliases_unmatched.tsv"
-DEFAULT_METADATA_PATH = DEFAULT_DATA_DIR / "pair_merged_data" / "reaction_aliases.metadata.json"
-DEFAULT_RHEA_CACHE_PATH = DEFAULT_DATA_DIR / "pair_merged_data" / "rhea_alias_cache.json"
+DEFAULT_OUTPUT_PATH = CARE_ROOT / "data" / "pair_merged_data" / "reaction_aliases.tsv"
+DEFAULT_UNMATCHED_PATH = CARE_ROOT / "data" / "pair_merged_data" / "reaction_aliases_unmatched.tsv"
+DEFAULT_METADATA_PATH = CARE_ROOT / "data" / "pair_merged_data" / "reaction_aliases.metadata.json"
+DEFAULT_RHEA_CACHE_PATH = CARE_ROOT / "data" / "pair_merged_data" / "rhea_alias_cache.json"
 
 
 csv.field_size_limit(sys.maxsize)

@@ -1,42 +1,42 @@
 nohup python task4/CREEP/step_01_train_CREEP_task4.py \
---device 0 \
---seed 42 \
---epochs 40 \
---batch_size 16 \
---num_workers 0 \
---ssl_emb_dim 256 \
---split_type rxn_sub_split \
---train_file data/rxn_sub_split/train_reactions.tsv \
---val_file data/rxn_sub_split/val_reactions.tsv \
---pair_db_path data/pair_merged_data/all_pair_data.tsv \
---enzyme_db_path data/pair_merged_data/enzyme_db_extended.json \
---reaction_aliases_path data/pair_merged_data/reaction_aliases.tsv \
---rxn_ec_number_path data/pair_merged_data/rxn_ec_number.tsv \
---ec_text_path processed_data/text2EC.csv \
---protein_backbone_model ProtT5 \
---text_backbone_model SciBERT \
---reaction_backbone_model rxnfp \
---protein_max_sequence_len 512 \
---text_max_sequence_len 512 \
---reaction_max_sequence_len 512 \
---protein_lr 1e-5 \
---protein_lr_scale 1.0 \
---text_lr 1e-5 \
---text_lr_scale 0.1 \
---reaction_lr 1e-5 \
---reaction_lr_scale 1.0 \
---cl_neg_samples 1 \
---cl_loss EBM_NCE \
---temperature 0.1 \
---decay 0.0 \
---alpha_contrastive 1.0 \
---alpha_generative 0.0 \
---use_three_modalities \
---num_batches_per_epoch 5000 \
---val_num_batches 500 \
---preprocessed_rxn_dir runtime/task4_preprocessed \
---output_model_dir task4/output/rxn_sub_split_run \
---wandb_project care-task4-creep \
---wandb_run_name creep-task4-rxn_sub_split \
---wandb_mode offline \
-> rxn_sub_split_run_nohup.log 2>&1 &
+    --device 0 \
+    --seed 42 \
+    --epochs 40 \
+    --batch_size 16 \
+    --num_workers 0 \
+    --ssl_emb_dim 256 \
+    --split_type rxn_sub_split \
+    --train_file data/rxn_sub_split/train_reactions.tsv \
+    --val_file data/rxn_sub_split/val_reactions.tsv \
+    --pair_db_path data/pair_merged_data/all_pair_data.tsv \
+    --enzyme_db_path data/pair_merged_data/enzyme_db_extended.json \
+    --reaction_aliases_path data/pair_merged_data/reaction_aliases.tsv \
+    --rxn_ec_number_path data/pair_merged_data/rxn_ec_number.tsv \
+    --ec_text_path processed_data/text2EC.csv \
+    --protein_backbone_model ProtT5 \
+    --text_backbone_model SciBERT \
+    --reaction_backbone_model rxnfp \
+    --protein_max_sequence_len 512 \
+    --text_max_sequence_len 512 \
+    --reaction_max_sequence_len 512 \
+    --protein_lr 1e-5 \
+    --protein_lr_scale 1.0 \
+    --text_lr 1e-5 \
+    --text_lr_scale 0.1 \
+    --reaction_lr 1e-5 \
+    --reaction_lr_scale 1.0 \
+    --cl_neg_samples 1 \
+    --cl_loss EBM_NCE \
+    --temperature 0.1 \
+    --decay 0.0 \
+    --alpha_contrastive 1.0 \
+    --alpha_generative 0.0 \
+    --use_three_modalities \
+    --num_batches_per_epoch 5000 \
+    --val_num_batches 500 \
+    --preprocessed_rxn_dir runtime/task4_preprocessed \
+    --output_model_dir task4/output/rxn_sub_split_run \
+    --wandb_project care-task4-creep \
+    --wandb_run_name creep-task4-rxn_sub_split \
+    --wandb_mode offline \
+    > rxn_sub_split_run_nohup.log 2>&1 &

@@ -1,0 +1,778 @@
+import argparse
+import gc
+import json
+import os
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer, BertModel, T5EncoderModel, T5Tokenizer
+
+try:
+    from rdkit import RDLogger
+
+    RDLogger.DisableLog("rdApp.error")
+except ImportError:
+    RDLogger = None
+
+SCRIPT_PATH = Path(__file__).resolve()
+
+# Support both layouts:
+# 1. repository-root/baseline/CARE/...
+# 2. standalone CARE/...
+if (SCRIPT_PATH.parents[2] / "CREEP").exists():
+    CARE_ROOT = SCRIPT_PATH.parents[2]
+    REPO_ROOT = CARE_ROOT.parent
+else:
+    REPO_ROOT = SCRIPT_PATH.parents[4]
+    CARE_ROOT = REPO_ROOT / "baseline" / "CARE"
+
+CREEP_ROOT = CARE_ROOT / "CREEP"
+for path in (REPO_ROOT, CARE_ROOT, CREEP_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+from CREEP.datasets.dataset_CREEP import encode_sequence
+from CREEP.datasets.dataset_task4 import _load_or_preprocess_pair_db, _normalize_text_value
+from CREEP.models import SingleModalityModel
+from CREEP.utils.tokenization import SmilesTokenizer
+
+BF16_DTYPE = torch.bfloat16
+
+
+class OrderedSequenceDataset(Dataset):
+    def __init__(self, entries, tokenizer, max_sequence_len, modality):
+        self.entries = entries
+        self.tokenizer = tokenizer
+        self.max_sequence_len = max_sequence_len
+        self.modality = modality
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, index):
+        item_id, sequence = self.entries[index]
+        if self.modality == "protein":
+            sequence = " ".join(sequence)
+        elif self.modality == "text":
+            sequence = _normalize_text_value(sequence)
+
+        sequence_input_ids, sequence_attention_mask = encode_sequence(
+            sequence,
+            self.tokenizer,
+            self.max_sequence_len,
+        )
+        return {
+            "item_id": item_id,
+            "sequence_input_ids": sequence_input_ids,
+            "sequence_attention_mask": sequence_attention_mask,
+        }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--ssl_emb_dim", type=int, default=256)
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        default="all",
+        choices=["enzyme_split", "rxn_sub_split", "all"],
+    )
+    parser.add_argument("--split_file", type=str, default=None)
+    parser.add_argument("--pretrained_folder", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument(
+        "--pair_db_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "all_pair_data.tsv"),
+    )
+    parser.add_argument(
+        "--enzyme_db_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "enzyme_db_extended.json"),
+    )
+    parser.add_argument(
+        "--enzyme_candidates_mode",
+        type=str,
+        default="extended",
+        choices=["extended", "original_entries"],
+    )
+    parser.add_argument(
+        "--enzyme_db_metadata_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "enzyme_db_extended.metadata.json"),
+    )
+    parser.add_argument(
+        "--rxn_db_metadata_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "metadata.csv"),
+    )
+    parser.add_argument(
+        "--reaction_aliases_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "reaction_aliases.tsv"),
+    )
+    parser.add_argument(
+        "--rxn_ec_number_path",
+        type=str,
+        default=str(CARE_ROOT / "data" / "pair_merged_data" / "rxn_ec_number.tsv"),
+    )
+    parser.add_argument(
+        "--ec_text_path",
+        type=str,
+        default=str(CARE_ROOT / "processed_data" / "text2EC.csv"),
+    )
+    parser.add_argument("--protein_backbone_model", type=str, default="ProtT5", choices=["ProtT5"])
+    parser.add_argument("--text_backbone_model", type=str, default="SciBERT")
+    parser.add_argument("--reaction_backbone_model", type=str, default="rxnfp")
+    parser.add_argument(
+        "--query_modality",
+        type=str,
+        default="reaction",
+        choices=["reaction", "text", "reaction_text_mean"],
+        help=(
+            "Query representation used to score proteins. The benchmark-compatible "
+            "default is reaction, producing a reaction-enzyme retrieval matrix."
+        ),
+    )
+    parser.add_argument("--protein_max_sequence_len", type=int, default=512)
+    parser.add_argument("--text_max_sequence_len", type=int, default=512)
+    parser.add_argument("--reaction_max_sequence_len", type=int, default=512)
+    parser.add_argument("--batch_size_protein", type=int, default=4)
+    parser.add_argument("--batch_size_text", type=int, default=256)
+    parser.add_argument("--batch_size_reaction", type=int, default=256)
+    parser.add_argument("--similarity_reaction_chunk_size", type=int, default=64)
+    parser.add_argument("--similarity_protein_chunk_size", type=int, default=65536)
+    parser.add_argument(
+        "--preprocessed_rxn_dir",
+        type=str,
+        default=str(CARE_ROOT / "runtime" / "task4_preprocessed"),
+    )
+    parser.add_argument("--max_reactions", type=int, default=None)
+    parser.add_argument("--max_enzymes", type=int, default=None)
+    parser.add_argument("--use_final_checkpoint", action="store_true")
+    parser.add_argument("--keep_embeddings", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def resolve_hf_local_model_dir(cache_root, model_id):
+    cache_root = Path(cache_root)
+    if (cache_root / "config.json").exists():
+        return str(cache_root)
+
+    repo_dir = cache_root / f"models--{model_id.replace('/', '--')}"
+    snapshots_dir = repo_dir / "snapshots"
+    if snapshots_dir.exists():
+        snapshot_dirs = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
+        if snapshot_dirs:
+            return str(snapshot_dirs[-1])
+    return str(cache_root)
+
+
+def get_split_file(split_type):
+    split_to_file = {
+        "enzyme_split": CARE_ROOT / "data" / "enzyme_split" / "val_pairs.tsv",
+        "rxn_sub_split": CARE_ROOT / "data" / "rxn_sub_split" / "val_reactions.tsv",
+    }
+    return split_to_file[split_type]
+
+
+def get_checkpoint_path(pretrained_folder, prefix, use_final_checkpoint):
+    model_suffix = "model_final.pth" if use_final_checkpoint else "model.pth"
+    return Path(pretrained_folder) / f"{prefix}_{model_suffix}"
+
+
+def load_state_dict(module, checkpoint_path):
+    print(f"Loading checkpoint: {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    module.load_state_dict(state_dict)
+    return module
+
+
+def convert_module_to_bf16(module, device=None):
+    if device is None:
+        return module.to(dtype=BF16_DTYPE)
+    return module.to(device=device, dtype=BF16_DTYPE)
+
+
+def build_protein_model(args, device):
+    protein_cache_dir = CREEP_ROOT / "data" / "pretrained_ProtT5"
+    protein_model_dir = resolve_hf_local_model_dir(
+        protein_cache_dir,
+        "Rostlab/prot_t5_xl_half_uniref50-enc",
+    )
+    protein_tokenizer = T5Tokenizer.from_pretrained(
+        protein_model_dir,
+        do_lower_case=False,
+        local_files_only=True,
+    )
+    protein_model = T5EncoderModel.from_pretrained(
+        protein_model_dir,
+        local_files_only=True,
+    )
+    protein_model = load_state_dict(
+        protein_model,
+        get_checkpoint_path(args.pretrained_folder, "protein", args.use_final_checkpoint),
+    )
+
+    protein2latent_model = nn.Linear(1024, args.ssl_emb_dim)
+    protein2latent_model = load_state_dict(
+        protein2latent_model,
+        get_checkpoint_path(args.pretrained_folder, "protein2latent", args.use_final_checkpoint),
+    )
+
+    model = SingleModalityModel(
+        protein_model,
+        protein2latent_model,
+        args.protein_backbone_model,
+        "protein",
+    )
+    model.eval()
+    model = convert_module_to_bf16(model, device=device)
+    return protein_tokenizer, model
+
+
+def build_text_model(args, device):
+    text_cache_dir = CREEP_ROOT / "data" / "pretrained_SciBert"
+    text_model_dir = resolve_hf_local_model_dir(
+        text_cache_dir,
+        "allenai/scibert_scivocab_uncased",
+    )
+    text_tokenizer = AutoTokenizer.from_pretrained(
+        text_model_dir,
+        local_files_only=True,
+        use_fast=False,
+    )
+    text_model = AutoModel.from_pretrained(
+        text_model_dir,
+        local_files_only=True,
+    )
+    text_model = load_state_dict(
+        text_model,
+        get_checkpoint_path(args.pretrained_folder, "text", args.use_final_checkpoint),
+    )
+
+    text2latent_model = nn.Linear(768, args.ssl_emb_dim)
+    text2latent_model = load_state_dict(
+        text2latent_model,
+        get_checkpoint_path(args.pretrained_folder, "text2latent", args.use_final_checkpoint),
+    )
+
+    model = SingleModalityModel(
+        text_model,
+        text2latent_model,
+        args.text_backbone_model,
+        "text",
+    )
+    model.eval()
+    model = convert_module_to_bf16(model, device=device)
+    return text_tokenizer, model
+
+
+def build_reaction_model(args, device):
+    rxnfp_dir = CREEP_ROOT / "data" / "pretrained_rxnfp"
+    reaction_tokenizer = SmilesTokenizer(str(rxnfp_dir / "vocab.txt"), do_lower_case=False)
+    reaction_model = BertModel.from_pretrained(str(rxnfp_dir), local_files_only=True)
+    reaction_model = load_state_dict(
+        reaction_model,
+        get_checkpoint_path(args.pretrained_folder, "reaction", args.use_final_checkpoint),
+    )
+
+    reaction2latent_model = nn.Linear(256, args.ssl_emb_dim)
+    reaction2latent_model = load_state_dict(
+        reaction2latent_model,
+        get_checkpoint_path(args.pretrained_folder, "reaction2latent", args.use_final_checkpoint),
+    )
+
+    model = SingleModalityModel(
+        reaction_model,
+        reaction2latent_model,
+        args.reaction_backbone_model,
+        "reaction",
+    )
+    model.eval()
+    model = convert_module_to_bf16(model, device=device)
+    return reaction_tokenizer, model
+
+
+def load_original_entry_limit(enzyme_db_metadata_path):
+    with open(enzyme_db_metadata_path) as f:
+        enzyme_db_metadata = json.load(f)
+
+    original_entries = enzyme_db_metadata.get("original_entries")
+    if original_entries is None:
+        raise ValueError(
+            f"`original_entries` is missing from enzyme db metadata: {enzyme_db_metadata_path}"
+        )
+    if not isinstance(original_entries, int) or original_entries < 0:
+        raise ValueError(
+            f"`original_entries` must be a non-negative integer in {enzyme_db_metadata_path}"
+        )
+    return original_entries
+
+
+def load_ordered_enzyme_entries(
+    enzyme_db_path,
+    enzyme_candidates_mode="extended",
+    enzyme_db_metadata_path=None,
+    max_enzymes=None,
+):
+    with open(enzyme_db_path) as f:
+        enzyme_db = json.load(f)
+
+    entries = list(enzyme_db.items())
+    original_entries = None
+    if enzyme_candidates_mode == "original_entries":
+        if enzyme_db_metadata_path is None:
+            raise ValueError(
+                "`enzyme_db_metadata_path` is required when --enzyme_candidates_mode=original_entries"
+            )
+        original_entries = load_original_entry_limit(enzyme_db_metadata_path)
+        if original_entries > len(entries):
+            raise ValueError(
+                f"Metadata original_entries={original_entries} exceeds enzyme db size={len(entries)}"
+            )
+        entries = entries[:original_entries]
+
+    if max_enzymes is not None:
+        entries = entries[:max_enzymes]
+    return entries, original_entries
+
+
+def load_screening_pair_ids(split_file, rxn_db_metadata_path, valid_enz_ids):
+    pair_ids = pd.read_csv(
+        split_file,
+        sep="\t" if str(split_file).endswith(".tsv") else ",",
+        usecols=["rxn_id", "enz_id"],
+    )
+
+    valid_rxn_ids = pd.read_csv(
+        rxn_db_metadata_path,
+        usecols=["rxn_id"],
+    )["rxn_id"]
+    pair_ids = pair_ids[
+        pair_ids["rxn_id"].isin(valid_rxn_ids) & pair_ids["enz_id"].isin(valid_enz_ids)
+    ].copy()
+    return pair_ids
+
+
+def load_ordered_reaction_entries(
+    split_file,
+    pair_db_path,
+    rxn_db_metadata_path,
+    valid_enz_ids,
+    enzyme_db_path=None,
+    preprocessed_dir=None,
+    reaction_aliases_path=None,
+    rxn_ec_number_path=None,
+    ec_text_path=None,
+    max_reactions=None,
+):
+    pair_ids = load_screening_pair_ids(
+        split_file=split_file,
+        rxn_db_metadata_path=rxn_db_metadata_path,
+        valid_enz_ids=valid_enz_ids,
+    )
+    ordered_rxn_ids = pair_ids["rxn_id"].drop_duplicates().tolist()
+    if max_reactions is not None:
+        ordered_rxn_ids = ordered_rxn_ids[:max_reactions]
+
+    pair_db = _load_or_preprocess_pair_db(
+        pair_db_path,
+        enzyme_db_path=enzyme_db_path,
+        preprocessed_dir=preprocessed_dir,
+        reaction_aliases_path=reaction_aliases_path,
+        rxn_ec_number_path=rxn_ec_number_path,
+        ec_text_path=ec_text_path,
+    )
+    valid_pair_db = pair_db.dropna(subset=["reaction"]).copy()
+    if "text" not in valid_pair_db.columns:
+        valid_pair_db["text"] = ""
+    valid_pair_db["text"] = valid_pair_db["text"].map(_normalize_text_value)
+
+    reaction_conflicts = valid_pair_db.groupby("rxn_id")["reaction"].nunique()
+    conflicting_rxns = reaction_conflicts[reaction_conflicts > 1]
+    if not conflicting_rxns.empty:
+        conflict_preview = conflicting_rxns.index[:5].tolist()
+        raise ValueError(f"Multiple reaction strings found for rxn_id(s): {conflict_preview}")
+
+    rxn_lookup = (
+        valid_pair_db.drop_duplicates("rxn_id")[["rxn_id", "reaction", "text"]]
+        .reset_index(drop=True)
+    )
+    ordered_reactions = pd.DataFrame({"rxn_id": ordered_rxn_ids}).merge(
+        rxn_lookup,
+        on="rxn_id",
+        how="left",
+    )
+
+    missing_rxns = ordered_reactions[ordered_reactions["reaction"].isna()]["rxn_id"].tolist()
+    if missing_rxns:
+        raise ValueError(f"Missing reaction strings for rxn_id(s): {missing_rxns[:10]}")
+
+    filtered_pair_ids = pair_ids[pair_ids["rxn_id"].isin(ordered_rxn_ids)].copy()
+    text_conflicts = valid_pair_db.groupby("rxn_id")["text"].nunique()
+    num_text_conflicts = int((text_conflicts > 1).sum())
+    return (
+        list(zip(ordered_reactions["rxn_id"].tolist(), ordered_reactions["reaction"].tolist())),
+        list(zip(ordered_reactions["rxn_id"].tolist(), ordered_reactions["text"].fillna("").tolist())),
+        filtered_pair_ids,
+        num_text_conflicts,
+    )
+
+
+def extract_embeddings(
+    entries,
+    tokenizer,
+    model,
+    batch_size,
+    num_workers,
+    max_sequence_len,
+    modality,
+    device,
+    output_path,
+    emb_dim,
+    verbose=False,
+):
+    dataset = OrderedSequenceDataset(entries, tokenizer, max_sequence_len, modality)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    embeddings = np.lib.format.open_memmap(
+        output_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(len(dataset), emb_dim),
+    )
+
+    iterator = tqdm(dataloader, desc=f"encode_{modality}") if verbose else dataloader
+    offset = 0
+    with torch.no_grad():
+        for batch in iterator:
+            sequence_input_ids = batch["sequence_input_ids"].to(device, non_blocking=True)
+            sequence_attention_mask = batch["sequence_attention_mask"].to(device, non_blocking=True)
+            repr_tensor = model(sequence_input_ids, sequence_attention_mask)
+            repr_tensor = F.normalize(repr_tensor.float(), dim=-1)
+            batch_repr = repr_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+            embeddings[offset : offset + len(batch_repr)] = batch_repr
+            offset += len(batch_repr)
+
+    embeddings.flush()
+    return output_path
+
+
+def combine_query_embeddings(reaction_embedding_path, text_embedding_path, output_path, emb_dim):
+    reaction_repr = np.load(reaction_embedding_path, mmap_mode="r")
+    text_repr = np.load(text_embedding_path, mmap_mode="r")
+    if reaction_repr.shape != text_repr.shape:
+        raise ValueError(
+            f"Reaction and text embedding shapes differ: {reaction_repr.shape} vs {text_repr.shape}"
+        )
+
+    combined = np.lib.format.open_memmap(
+        output_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(reaction_repr.shape[0], emb_dim),
+    )
+    for row_start in range(0, reaction_repr.shape[0], 4096):
+        row_end = min(row_start + 4096, reaction_repr.shape[0])
+        block = np.asarray(reaction_repr[row_start:row_end], dtype=np.float32)
+        block = block + np.asarray(text_repr[row_start:row_end], dtype=np.float32)
+        norm = np.linalg.norm(block, axis=1, keepdims=True)
+        norm[norm == 0.0] = 1.0
+        combined[row_start:row_end] = block / norm
+
+    combined.flush()
+    return output_path
+
+
+def compute_similarity_matrix(
+    query_embedding_path,
+    protein_embedding_path,
+    output_path,
+    query_chunk_size,
+    protein_chunk_size,
+    verbose=False,
+):
+    query_repr = np.load(query_embedding_path, mmap_mode="r")
+    protein_repr = np.load(protein_embedding_path, mmap_mode="r")
+    pred_matrix = np.lib.format.open_memmap(
+        output_path,
+        mode="w+",
+        dtype=np.float32,
+        shape=(query_repr.shape[0], protein_repr.shape[0]),
+    )
+
+    row_ranges = range(0, query_repr.shape[0], query_chunk_size)
+    if verbose:
+        row_ranges = tqdm(row_ranges, desc="cosine_similarity")
+
+    for row_start in row_ranges:
+        row_end = min(row_start + query_chunk_size, query_repr.shape[0])
+        query_block = np.asarray(query_repr[row_start:row_end], dtype=np.float32)
+        for col_start in range(0, protein_repr.shape[0], protein_chunk_size):
+            col_end = min(col_start + protein_chunk_size, protein_repr.shape[0])
+            protein_block = np.asarray(protein_repr[col_start:col_end], dtype=np.float32)
+            pred_matrix[row_start:row_end, col_start:col_end] = np.dot(
+                query_block,
+                protein_block.T,
+            )
+
+    pred_matrix.flush()
+    return output_path
+
+
+def write_single_column_tsv(path, column_name, values):
+    with open(path, "w") as f:
+        f.write(f"{column_name}\n")
+        for value in values:
+            f.write(f"{value}\n")
+
+
+def build_metadata(
+    args,
+    split_type,
+    split_file,
+    row_ids,
+    col_ids,
+    pred_path,
+    filtered_pair_ids,
+    num_text_conflicts,
+):
+    pred_array = np.load(pred_path, mmap_mode="r")
+    return {
+        "split_type": split_type,
+        "split_file": str(split_file),
+        "pair_db_path": str(args.pair_db_path),
+        "enzyme_db_path": str(args.enzyme_db_path),
+        "enzyme_candidates_mode": args.enzyme_candidates_mode,
+        "enzyme_db_metadata_path": str(args.enzyme_db_metadata_path),
+        "rxn_db_metadata_path": str(args.rxn_db_metadata_path),
+        "reaction_aliases_path": str(args.reaction_aliases_path),
+        "rxn_ec_number_path": str(args.rxn_ec_number_path),
+        "ec_text_path": str(args.ec_text_path),
+        "pretrained_folder": str(args.pretrained_folder),
+        "checkpoint_variant": "final" if args.use_final_checkpoint else "best",
+        "query_modality": args.query_modality,
+        "dtype": str(pred_array.dtype),
+        "shape": [int(pred_array.shape[0]), int(pred_array.shape[1])],
+        "num_reactions": len(row_ids),
+        "num_enzymes": len(col_ids),
+        "num_filtered_pairs": int(len(filtered_pair_ids)),
+        "num_filtered_positive_enzymes": int(filtered_pair_ids["enz_id"].nunique()),
+        "num_reactions_with_multiple_texts": num_text_conflicts,
+        "original_entry_limit": (
+            load_original_entry_limit(args.enzyme_db_metadata_path)
+            if args.enzyme_candidates_mode == "original_entries"
+            else None
+        ),
+        "max_reactions": args.max_reactions,
+        "max_enzymes": args.max_enzymes,
+    }
+
+
+def cleanup_model(model):
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def ensure_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def get_output_suffix(enzyme_candidates_mode, query_modality):
+    suffix = "" if enzyme_candidates_mode == "extended" else f"_{enzyme_candidates_mode}"
+    if query_modality != "reaction":
+        suffix = f"{suffix}_{query_modality}"
+    return suffix
+
+
+def main():
+    args = parse_args()
+    print("arguments", args)
+
+    set_seed(args.seed)
+    device = torch.device(f"cuda:{args.device}") if torch.cuda.is_available() else torch.device("cpu")
+    output_dir = Path(args.output_dir) if args.output_dir else Path(args.pretrained_folder) / "predictions"
+    ensure_dir(output_dir)
+
+    split_types = ["enzyme_split", "rxn_sub_split"] if args.split_type == "all" else [args.split_type]
+
+    enzyme_entries, _ = load_ordered_enzyme_entries(
+        args.enzyme_db_path,
+        enzyme_candidates_mode=args.enzyme_candidates_mode,
+        enzyme_db_metadata_path=args.enzyme_db_metadata_path,
+        max_enzymes=args.max_enzymes,
+    )
+    enzyme_ids = [enzyme_id for enzyme_id, _ in enzyme_entries]
+    valid_enzyme_ids = set(enzyme_ids)
+    output_suffix = get_output_suffix(args.enzyme_candidates_mode, args.query_modality)
+    protein_embedding_path = output_dir / f"_tmp_protein_embeddings{output_suffix}.npy"
+
+    protein_tokenizer, protein_model = build_protein_model(args, device)
+    extract_embeddings(
+        entries=enzyme_entries,
+        tokenizer=protein_tokenizer,
+        model=protein_model,
+        batch_size=args.batch_size_protein,
+        num_workers=args.num_workers,
+        max_sequence_len=args.protein_max_sequence_len,
+        modality="protein",
+        device=device,
+        output_path=protein_embedding_path,
+        emb_dim=args.ssl_emb_dim,
+        verbose=args.verbose,
+    )
+    cleanup_model(protein_model)
+
+    reaction_tokenizer = reaction_model = None
+    text_tokenizer = text_model = None
+    if args.query_modality in {"reaction", "reaction_text_mean"}:
+        reaction_tokenizer, reaction_model = build_reaction_model(args, device)
+    if args.query_modality in {"text", "reaction_text_mean"}:
+        text_tokenizer, text_model = build_text_model(args, device)
+
+    for split_type in split_types:
+        split_file = Path(args.split_file) if args.split_file else get_split_file(split_type)
+        reaction_entries, text_entries, filtered_pair_ids, num_text_conflicts = load_ordered_reaction_entries(
+            split_file=split_file,
+            pair_db_path=args.pair_db_path,
+            rxn_db_metadata_path=args.rxn_db_metadata_path,
+            valid_enz_ids=valid_enzyme_ids,
+            enzyme_db_path=args.enzyme_db_path,
+            preprocessed_dir=args.preprocessed_rxn_dir,
+            reaction_aliases_path=args.reaction_aliases_path,
+            rxn_ec_number_path=args.rxn_ec_number_path,
+            ec_text_path=args.ec_text_path,
+            max_reactions=args.max_reactions,
+        )
+        reaction_ids = [reaction_id for reaction_id, _ in reaction_entries]
+        reaction_embedding_path = output_dir / f"_tmp_{split_type}_reaction_embeddings.npy"
+        text_embedding_path = output_dir / f"_tmp_{split_type}_text_embeddings.npy"
+        query_embedding_path = output_dir / f"_tmp_{split_type}_{args.query_modality}_query_embeddings.npy"
+        pred_path = output_dir / f"{split_type}{output_suffix}_preds.npy"
+        row_path = output_dir / f"{split_type}{output_suffix}_row_rxn_ids.tsv"
+        col_path = output_dir / f"{split_type}{output_suffix}_col_enz_ids.tsv"
+        metadata_path = output_dir / f"{split_type}{output_suffix}_metadata.json"
+
+        tmp_paths = []
+        if args.query_modality in {"reaction", "reaction_text_mean"}:
+            extract_embeddings(
+                entries=reaction_entries,
+                tokenizer=reaction_tokenizer,
+                model=reaction_model,
+                batch_size=args.batch_size_reaction,
+                num_workers=args.num_workers,
+                max_sequence_len=args.reaction_max_sequence_len,
+                modality="reaction",
+                device=device,
+                output_path=reaction_embedding_path,
+                emb_dim=args.ssl_emb_dim,
+                verbose=args.verbose,
+            )
+            tmp_paths.append(reaction_embedding_path)
+
+        if args.query_modality in {"text", "reaction_text_mean"}:
+            extract_embeddings(
+                entries=text_entries,
+                tokenizer=text_tokenizer,
+                model=text_model,
+                batch_size=args.batch_size_text,
+                num_workers=args.num_workers,
+                max_sequence_len=args.text_max_sequence_len,
+                modality="text",
+                device=device,
+                output_path=text_embedding_path,
+                emb_dim=args.ssl_emb_dim,
+                verbose=args.verbose,
+            )
+            tmp_paths.append(text_embedding_path)
+
+        if args.query_modality == "reaction":
+            query_path_for_similarity = reaction_embedding_path
+        elif args.query_modality == "text":
+            query_path_for_similarity = text_embedding_path
+        else:
+            combine_query_embeddings(
+                reaction_embedding_path=reaction_embedding_path,
+                text_embedding_path=text_embedding_path,
+                output_path=query_embedding_path,
+                emb_dim=args.ssl_emb_dim,
+            )
+            query_path_for_similarity = query_embedding_path
+            tmp_paths.append(query_embedding_path)
+
+        compute_similarity_matrix(
+            query_embedding_path=query_path_for_similarity,
+            protein_embedding_path=protein_embedding_path,
+            output_path=pred_path,
+            query_chunk_size=args.similarity_reaction_chunk_size,
+            protein_chunk_size=args.similarity_protein_chunk_size,
+            verbose=args.verbose,
+        )
+
+        write_single_column_tsv(row_path, "rxn_id", reaction_ids)
+        write_single_column_tsv(col_path, "enz_id", enzyme_ids)
+        with open(metadata_path, "w") as f:
+            json.dump(
+                build_metadata(
+                    args,
+                    split_type,
+                    split_file,
+                    reaction_ids,
+                    enzyme_ids,
+                    pred_path,
+                    filtered_pair_ids,
+                    num_text_conflicts,
+                ),
+                f,
+                indent=2,
+            )
+
+        if not args.keep_embeddings:
+            for tmp_path in tmp_paths:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+
+    if reaction_model is not None:
+        cleanup_model(reaction_model)
+    if text_model is not None:
+        cleanup_model(text_model)
+    if not args.keep_embeddings and protein_embedding_path.exists():
+        protein_embedding_path.unlink()
+
+
+if __name__ == "__main__":
+    main()

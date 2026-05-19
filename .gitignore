@@ -202,3 +202,8 @@ dmypy.json
 
 task4/logs/
 task4/run_retrieve_reaction_aliases.pbs
+task4/jobs/run_task4_model_task3_benchmark_rxn_sub_split.pbs
+task4/output/task3_benchmark_preds/rxn_sub_split_original_entries_col_enz_ids.tsv
+task4/output/task3_benchmark_preds/rxn_sub_split_original_entries_metadata.json
+task4/output/task3_benchmark_preds/rxn_sub_split_original_entries_preds.npy
+task4/output/task3_benchmark_preds/rxn_sub_split_original_entries_row_rxn_ids.tsv

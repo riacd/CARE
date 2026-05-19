@@ -19,8 +19,20 @@ def write_json(data, path):
     with open(path, 'w') as f:
         json.dump(data, f, indent=4)
 
+def get_valid_rxn_ids(rxn_db_path):
+    if not rxn_db_path:
+        return None
+
+    metadata_path = rxn_db_path
+    if os.path.isdir(rxn_db_path):
+        metadata_path = os.path.join(rxn_db_path, 'metadata.csv')
+    if not os.path.exists(metadata_path):
+        return None
+
+    valid_rxn_ids = pd.read_csv(metadata_path, usecols=['rxn_id'])['rxn_id']
+    return set(valid_rxn_ids)
+
 def get_pair_ids(rxn_db_dir, enz_db_path, ids_path):
-    del rxn_db_dir
     pair_ids = pd.read_csv(
         ids_path,
         sep='\t' if ids_path.endswith('.tsv') else ',',
@@ -28,6 +40,9 @@ def get_pair_ids(rxn_db_dir, enz_db_path, ids_path):
     )
     valid_enz_ids = read_json(enz_db_path).keys()
     pair_ids = pair_ids[pair_ids['enz_id'].isin(valid_enz_ids)]
+    valid_rxn_ids = get_valid_rxn_ids(rxn_db_dir)
+    if valid_rxn_ids is not None:
+        pair_ids = pair_ids[pair_ids['rxn_id'].isin(valid_rxn_ids)]
     return pair_ids
 
 def get_query_ids(train_ids, test_ids, seed=42):
@@ -195,9 +210,19 @@ def parse_args():
 # python -m scripts.screening.screen_scores -tid train_ids路径 -sid test_ids路径 -pp preds矩阵路径 -t 1 -sp predictions/temp.json
 # 用上面个这个命令来算分
 # 使用 Protein_CUDA121 环境，注意检查环境中 python 解释器链接正确，
-# -pp /mnt/shared-storage-user/huyutong/CARE/data/inference_preds_bs40/enzyme_split_original_entries_preds.npy \
+# python -m task3.screen_scores \
+# -pp /mnt/shared-storage-user/huyutong/CARE/task4/output/enzyme_split_run/predictions/enzyme_split_original_entries_preds.npy \
 # -tid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/train_pairs.tsv \
 # -sid /mnt/shared-storage-user/huyutong/CARE/data/enzyme_split/val_pairs.tsv \
+# -t 1 \
+# -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json \
+# -edb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/enzyme_db.json \
+# -rdb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data
+
+# python -m task3.screen_scores \
+# -pp /mnt/shared-storage-user/huyutong/CARE/task4/output/rxn_sub_split_run/predictions/rxn_sub_split_original_entries_preds.npy \
+# -tid /mnt/shared-storage-user/huyutong/CARE/data/rxn_sub_split/train_reactions.tsv \
+# -sid /mnt/shared-storage-user/huyutong/CARE/data/rxn_sub_split/val_reactions.tsv \
 # -t 1 \
 # -sp /mnt/shared-storage-user/huyutong/CARE/tmp.json \
 # -edb /mnt/shared-storage-user/huyutong/CARE/data/pair_merged_data/enzyme_db.json \
@@ -261,6 +286,12 @@ if __name__ == '__main__':
     eval_preds = load_pred_matrix(args.pred_path).detach().to(device)
     eval_labels = eval_labels.to(device)
     sims = sims.to(device)
+    if eval_preds.size(0) != eval_labels.size(0) or sims.size(0) != eval_labels.size(0):
+        raise ValueError(
+            f'Row count mismatch: preds={eval_preds.size(0)}, '
+            f'labels={eval_labels.size(0)}, sims={sims.size(0)}. '
+            'Check that --rxn_db_dir points to the same reaction metadata used for inference.'
+        )
     
     # compute and save scores
     if os.path.exists(args.score_path) and not args.overwrite:
